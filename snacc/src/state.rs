@@ -311,6 +311,14 @@ pub struct MacroState {
     pub last_update_ms: u64,
     /// `V_epoch` — volume aktivitas ter-decay untuk `CrucibleTemp = 1000 × V / M_supply`.
     pub volume_epoch: u128,
+    /// Total suplai `$SNACC` beredar (`I-01`, bertambah saat `incubate_strain`, berkurang saat burn).
+    pub total_snacc_supply: u128,
+    /// Akumulasi `$SNACC` yang dibakar (`I-01`, Fever burn + `ft_burn`).
+    pub total_snacc_burned: u128,
+    /// Akumulasi subsidi treasury pada epoch berjalan (`I-04`).
+    pub epoch_treasury_spent: u128,
+    /// Snapshot saldo treasury di awal epoch untuk batas subsidi `500 bps` (`I-04`).
+    pub epoch_treasury_initial: u128,
     /// Diskon feed aktif (`EN-01`, `0..=MAX_BURST_BPS`).
     pub nutrient_burst_bps: u16,
     /// Epoch berakhirnya burst (`EN-01`).
@@ -332,6 +340,10 @@ impl Default for MacroState {
             current_epoch: 0,
             last_update_ms: 0,
             volume_epoch: 0,
+            total_snacc_supply: 0,
+            total_snacc_burned: 0,
+            epoch_treasury_spent: 0,
+            epoch_treasury_initial: 0,
             nutrient_burst_bps: 0,
             nutrient_burst_until: 0,
             industrial_dividend_pool: 0,
@@ -339,6 +351,70 @@ impl Default for MacroState {
             epoch_aether_burned_total: 0,
             last_closed_epoch: 0,
             params: TermostatParams::default(),
+        }
+    }
+}
+
+/// Tampilan baca-saja `get_macro_state` (`F4`, `VC-005`) — mirror `MacroState` + `crucible_temp`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MacroStateView {
+    pub current_epoch: Epoch,
+    pub last_update_ms: u64,
+    pub volume_epoch: u128,
+    pub total_snacc_supply: u128,
+    pub total_snacc_burned: u128,
+    pub epoch_treasury_spent: u128,
+    pub epoch_treasury_initial: u128,
+    pub nutrient_burst_bps: u16,
+    pub nutrient_burst_until: Epoch,
+    pub industrial_dividend_pool: u128,
+    pub epoch_dividend_inflow: u128,
+    pub epoch_aether_burned_total: u128,
+    pub last_closed_epoch: Epoch,
+    pub params: TermostatParams,
+    /// Suhu makro terhitung (`mK`, lazy decay tanpa cron — `ADR-04`).
+    pub crucible_temp: u64,
+}
+
+impl MacroState {
+    /// `V_decayed = max(0, volume_epoch - (now_sec - last_update_ms / 1000) * volume_decay_per_sec)` (`ADR-04`).
+    pub fn decayed_volume(&self, now_ms: u64) -> u128 {
+        let elapsed_sec = if self.last_update_ms == 0 {
+            0
+        } else {
+            (now_ms / 1000).saturating_sub(self.last_update_ms / 1000)
+        };
+        let decay =
+            (elapsed_sec as u128).saturating_mul(self.params.volume_decay_per_sec as u128);
+        self.volume_epoch.saturating_sub(decay)
+    }
+
+    /// `CrucibleTemp = floor(1000 * V_decayed / max(total_snacc_supply, 1))` (`F4`, `ADR-04`).
+    pub fn crucible_temp_at(&self, now_ms: u64) -> u64 {
+        let v_decayed = self.decayed_volume(now_ms);
+        let denom = std::cmp::max(self.total_snacc_supply, 1);
+        (v_decayed.saturating_mul(1000) / denom) as u64
+    }
+
+    /// Bangun `MacroStateView` dengan `crucible_temp` pada `now_ms`.
+    pub fn to_view(&self, now_ms: u64) -> MacroStateView {
+        MacroStateView {
+            current_epoch: self.current_epoch,
+            last_update_ms: self.last_update_ms,
+            volume_epoch: self.volume_epoch,
+            total_snacc_supply: self.total_snacc_supply,
+            total_snacc_burned: self.total_snacc_burned,
+            epoch_treasury_spent: self.epoch_treasury_spent,
+            epoch_treasury_initial: self.epoch_treasury_initial,
+            nutrient_burst_bps: self.nutrient_burst_bps,
+            nutrient_burst_until: self.nutrient_burst_until,
+            industrial_dividend_pool: self.industrial_dividend_pool,
+            epoch_dividend_inflow: self.epoch_dividend_inflow,
+            epoch_aether_burned_total: self.epoch_aether_burned_total,
+            last_closed_epoch: self.last_closed_epoch,
+            params: self.params.clone(),
+            crucible_temp: self.crucible_temp_at(now_ms),
         }
     }
 }

@@ -15,8 +15,8 @@ use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
-    constants, AlkemisProfile, MacroState, MnaLogEntry, OrganelleSlots, StrainId, StrainRole,
-    StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
+    constants, AlkemisProfile, MacroState, MacroStateView, MnaLogEntry, OrganelleSlots, StrainId,
+    StrainRole, StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
 };
 
 /// State kontrak — `D1–D8` (`D9` = event `NEP-297`, tanpa state). `VC-002`.
@@ -139,10 +139,14 @@ impl SnaccContract {
             status: StrainStatus::Active,
         };
 
-        // `D2` ledger, `D6` neraca internal & treasury.
+        // `D2` ledger, `D6` neraca internal & treasury, `D7` suplai `$SNACC` (`I-01`).
         let _ = self.strains.insert(strain_id, vessel.clone());
         let _ = self.snacc_balances.insert(strain_id, to_strain);
         self.treasury += to_treasury;
+        self.macro_state.total_snacc_supply += stake;
+        if self.macro_state.current_epoch == 0 {
+            self.macro_state.epoch_treasury_initial += to_treasury;
+        }
 
         // `D3` — `mt_mint` spora genesis `NEP-245` ke inventori `(strain_id, token_id)`.
         let spore_key: (StrainId, TokenId) =
@@ -249,6 +253,56 @@ impl SnaccContract {
     }
 
     // =====================================================================
+    // VC-005 — `F4`: Termostat Makro `CrucibleTemp` (`ADR-04`, `I-01`, `I-04`)
+    // =====================================================================
+
+    /// `F4` / `ADR-04` — suhu makro `CrucibleTemp` (`mK`) dengan lazy decay tanpa cron:
+    /// `floor(1000 * V_decayed / max(total_snacc_supply, 1))`.
+    pub fn get_crucible_temp(&self) -> u64 {
+        let now_ms = env::block_timestamp() / 1_000_000;
+        self.macro_state.crucible_temp_at(now_ms)
+    }
+
+    /// `F4` — view `MacroState` + `crucible_temp` terhitung pada timestamp saat ini.
+    pub fn get_macro_state(&self) -> MacroStateView {
+        let now_ms = env::block_timestamp() / 1_000_000;
+        self.macro_state.to_view(now_ms)
+    }
+
+    /// `F4` — transisi epoch minimal (`VC-005`): naikkan `current_epoch`, reset
+    /// `epoch_treasury_spent`, dan snapshot `epoch_treasury_initial = self.treasury`.
+    /// TODO(DK-033): distribusi `industrial_dividend_pool` & penutupan dividen epoch penuh.
+    pub fn advance_epoch(&mut self) {
+        self.macro_state.current_epoch = self.macro_state.current_epoch.saturating_add(1);
+        self.macro_state.epoch_treasury_spent = 0;
+        self.macro_state.epoch_treasury_initial = self.treasury;
+    }
+
+    /// `F4` / `I-01` — bakar `$SNACC` dari neraca `snacc_balances[strain_id]`.
+    /// TODO(VC-006/NEP-141): selaraskan signature `ft_burn(amount: U128)` saat ledger NEP-141 global tersedia.
+    pub fn ft_burn(&mut self, strain_id: StrainId, amount: U128) {
+        let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        assert!(
+            bal >= amount.0,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+        let _ = self.snacc_balances.insert(strain_id, bal - amount.0);
+        self.macro_state.total_snacc_supply = self
+            .macro_state
+            .total_snacc_supply
+            .saturating_sub(amount.0);
+        self.macro_state.total_snacc_burned = self
+            .macro_state
+            .total_snacc_burned
+            .saturating_add(amount.0);
+        if let Some(mut v) = self.strains.get(&strain_id).cloned() {
+            v.record_mutation();
+            let _ = self.strains.insert(strain_id, v);
+        }
+    }
+
+    // =====================================================================
     // VC-004 — `F2`: rantai pasok 3-tahap `NEP-245` + Lazy BMR (`ADR-12/13`)
     // =====================================================================
 
@@ -268,18 +322,59 @@ impl SnaccContract {
         );
     }
 
-    /// Katalis `$SNACC` (`F2`/`F4`): `assert` == attached deposit (`ERR_STAKE_DEPOSIT_MISMATCH`),
-    /// sementara masuk `treasury` + `macro_state.volume_epoch`.
-    /// TODO(VC-005): termostat `F4` (3,5% `ft_burn` / 2,0% rebate / 50% dividen).
-    fn take_catalyst_fee(&mut self, fee: &U128) {
+    /// Katalis `$SNACC` (`F2`/`F4`, `VC-005`):
+    /// - Validasi `attached_deposit == fee` (`ERR_STAKE_DEPOSIT_MISMATCH`).
+    /// - Perbarui `volume_epoch` (termasuk lazy decay sejak `last_update_ms`) + `last_update_ms`.
+    /// - Hitung `temp = get_crucible_temp()`:
+    ///   * `temp > 1400` (Calcination Fever): `burn = fee * 350 / 10000`, `total_snacc_supply -= burn`,
+    ///     `total_snacc_burned += burn` (`I-01`), sisa `fee - burn` masuk `treasury`.
+    ///   * `temp < 600` (Hypothermia): `fee` masuk `treasury`; `rebate = fee * 200 / 10000`
+    ///     dibatasi sisa kuota epoch `epoch_treasury_initial * 500 / 10000 - epoch_treasury_spent` (`I-04`),
+    ///     dibayar dari `treasury` ke `snacc_balances[strain_id]`.
+    ///   * `600..=1400` (Zona tengah): `fee` masuk `treasury` tanpa burn/rebate.
+    fn take_catalyst_fee(&mut self, strain_id: StrainId, fee: &U128) {
         assert_eq!(
             env::attached_deposit().as_yoctonear(),
             fee.0,
             "{}",
             constants::ERR_STAKE_DEPOSIT_MISMATCH
         );
-        self.treasury = self.treasury.saturating_add(fee.0);
-        self.macro_state.volume_epoch = self.macro_state.volume_epoch.saturating_add(fee.0);
+        let now_ms = env::block_timestamp() / 1_000_000;
+        let v_decayed = self.macro_state.decayed_volume(now_ms);
+        self.macro_state.volume_epoch = v_decayed.saturating_add(fee.0);
+        self.macro_state.last_update_ms = now_ms;
+
+        let temp = self.get_crucible_temp();
+        if temp > self.macro_state.params.fever_threshold_mk {
+            let burn = fee.0 * self.macro_state.params.fever_burn_bps as u128
+                / constants::BPS_DENOMINATOR;
+            self.macro_state.total_snacc_supply =
+                self.macro_state.total_snacc_supply.saturating_sub(burn);
+            self.macro_state.total_snacc_burned =
+                self.macro_state.total_snacc_burned.saturating_add(burn);
+            let remainder = fee.0.saturating_sub(burn);
+            self.treasury = self.treasury.saturating_add(remainder);
+        } else if temp < self.macro_state.params.hypothermia_threshold_mk {
+            let raw_rebate = fee.0 * self.macro_state.params.rebate_bps as u128
+                / constants::BPS_DENOMINATOR;
+            let max_epoch_drain = self.macro_state.epoch_treasury_initial
+                * self.macro_state.params.max_epoch_treasury_drain_bps as u128
+                / constants::BPS_DENOMINATOR;
+            let remaining_quota =
+                max_epoch_drain.saturating_sub(self.macro_state.epoch_treasury_spent);
+            let rebate = raw_rebate.min(remaining_quota).min(self.treasury);
+            self.treasury = self.treasury.saturating_add(fee.0).saturating_sub(rebate);
+            if rebate > 0 {
+                let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+                let _ = self
+                    .snacc_balances
+                    .insert(strain_id, bal.saturating_add(rebate));
+                self.macro_state.epoch_treasury_spent =
+                    self.macro_state.epoch_treasury_spent.saturating_add(rebate);
+            }
+        } else {
+            self.treasury = self.treasury.saturating_add(fee.0);
+        }
     }
 
     /// Pemulihan metabolik (`F2`): `vitality = min(10000, effective + 500)`, `last_fed_sec = now`.
@@ -336,7 +431,7 @@ impl SnaccContract {
             "{}",
             constants::ERR_UNKNOWN_TOKEN
         );
-        self.take_catalyst_fee(&snacc_catalyst_fee);
+        self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
         self.inv_mint(strain_id, &spore_type, 1);
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
@@ -387,7 +482,7 @@ impl SnaccContract {
         } else {
             env::panic_str(constants::ERR_INSUFFICIENT_BALANCE)
         };
-        self.take_catalyst_fee(&snacc_catalyst_fee);
+        self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
         for (token, amount) in recipe.1 {
             if amount > 0 {
                 self.inv_burn(strain_id, token, amount);
@@ -460,7 +555,7 @@ impl SnaccContract {
             "{}",
             constants::ERR_INSUFFICIENT_BALANCE
         );
-        self.take_catalyst_fee(&snacc_catalyst_fee);
+        self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
         self.inv_burn(strain_id, enz_a, need_a);
         self.inv_burn(strain_id, enz_b, need_b);
         self.inv_mint(strain_id, &elixir_type, batches);
@@ -749,7 +844,7 @@ mod tests {
         let _ = c.extract_spores(1, "mt:spore-cryo".to_string(), U128(0));
         assert_eq!(c.inventories.get(&(1, "mt:spore-cryo".to_string())), Some(&1));
         // baseline treasury = 20% stake inkubasi (2e11) + katalis 7.
-        assert_eq!(c.treasury, 200_000_000_000 + 7); // TODO VC-005: termostat
+        assert_eq!(c.treasury, 200_000_000_000 + 7);
     }
 
     #[test]
@@ -868,5 +963,206 @@ mod tests {
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(5));
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(9));
     }
-}
 
+    // ----------------------------------------------------------------------
+    // VC-005 — F4: Termostat Makro CrucibleTemp (ADR-04, I-01, I-04)
+    // ----------------------------------------------------------------------
+
+    /// (1 & 2) Rumus suhu `get_crucible_temp` termasuk lazy decay pada 2 titik waktu (`ADR-04`).
+    #[test]
+    fn vc005_crucible_temp_lazy_decay_dua_titik_waktu() {
+        let mut c = SnaccContract::new();
+        // stake = 10_000 -> total_snacc_supply = 10_000
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert_eq!(c.macro_state.total_snacc_supply, 10_000);
+
+        // Titik waktu 1: t1 = 3600s (3_600_000_000_000 ns), fee = 10_000 -> volume_epoch = 10_000
+        // temp(t1) = floor(1000 * 10_000 / 10_000) = 1000 mK (zona netral, supply tetap 10_000)
+        let t1_ns = 3_600_000_000_000u64;
+        set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(10_000), t1_ns);
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        assert_eq!(c.get_crucible_temp(), 1000);
+
+        // Titik waktu 2: t2 = t1 + 40 detik -> decay = 40 * 50 = 2_000 -> V_decayed = 8_000
+        // temp(t2) = floor(1000 * 8_000 / 10_000) = 800 mK
+        let t2_ns = t1_ns + 40 * 1_000_000_000;
+        set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(0), t2_ns);
+        assert_eq!(c.get_crucible_temp(), 800);
+
+        // Setelah 500 detik (decay 25_000 > 10_000) -> saturasi ke 0
+        let t3_ns = t1_ns + 500 * 1_000_000_000;
+        set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(0), t3_ns);
+        assert_eq!(c.get_crucible_temp(), 0);
+    }
+
+    /// (3) Calcination Fever (`temp > 1400`): membakar 350 bps + invarian `I-01`
+    /// (`total_snacc_supply` turun sebesar `burn`, `total_snacc_burned` naik sama besar, sisa ke treasury).
+    #[test]
+    fn vc005_fever_burn_350_bps_dan_invarian_i01() {
+        let mut c = SnaccContract::new();
+        let stake = 10_000u128; // treasury awal = 2_000, strain = 8_000, supply = 10_000
+        let _ = call_incubate(&mut c, stake, EXTRACTOR_ROLE, 0);
+        let supply_before = c.macro_state.total_snacc_supply;
+        let treasury_before = c.treasury;
+
+        // Fee = 20_000 -> volume_epoch = 20_000 -> temp = floor(1000 * 20_000 / 10_000) = 2000 > 1400 (Fever!)
+        // burn = 20_000 * 350 / 10_000 = 700; sisa ke treasury = 19_300.
+        let fee = 20_000u128;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(fee));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(fee));
+
+        let expected_burn = 700u128;
+        assert_eq!(c.macro_state.total_snacc_burned, expected_burn);
+        assert_eq!(c.macro_state.total_snacc_supply, supply_before - expected_burn);
+        assert_eq!(
+            c.macro_state.total_snacc_supply + c.macro_state.total_snacc_burned,
+            supply_before
+        );
+        assert_eq!(c.treasury, treasury_before + (fee - expected_burn));
+    }
+
+    /// (3) Hypothermia (`temp < 600`): rebate 200 bps dari treasury ke `snacc_balances[strain_id]`.
+    #[test]
+    fn vc005_hypothermia_rebate_200_bps() {
+        let mut c = SnaccContract::new();
+        let stake = 1_000_000u128; // supply = 1_000_000, treasury = 200_000, strain = 800_000
+        let _ = call_incubate(&mut c, stake, EXTRACTOR_ROLE, 0);
+        c.advance_epoch(); // snapshot epoch_treasury_initial = 200_000 (kuota 500 bps = 10_000)
+
+        let bal_before = c.snacc_balances.get(&1).copied().unwrap();
+        let treasury_before = c.treasury;
+
+        // Fee = 10_000 -> temp = floor(1000 * 10_000 / 1_000_000) = 10 < 600 (Hypothermia)
+        // rebate = 10_000 * 200 / 10_000 = 200 (dari treasury ke snacc_balances[1]).
+        let fee = 10_000u128;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(fee));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(fee));
+
+        let expected_rebate = 200u128;
+        assert_eq!(
+            c.snacc_balances.get(&1).copied().unwrap(),
+            bal_before + expected_rebate
+        );
+        // Sisa fee masuk treasury (+10_000), rebate keluar dari treasury (-200).
+        assert_eq!(c.treasury, treasury_before + fee - expected_rebate);
+        assert_eq!(c.macro_state.epoch_treasury_spent, expected_rebate);
+    }
+
+    /// (3) Invarian `I-04`: rebate berhenti saat kuota 500 bps epoch habis (tanpa panic).
+    #[test]
+    fn vc005_invarian_i04_kuota_epoch_500_bps_habis_tanpa_panic() {
+        let mut c = SnaccContract::new();
+        // stake = 1_000_000 -> treasury = 200_000 -> max_epoch_drain (500 bps) = 10_000
+        let _ = call_incubate(&mut c, 1_000_000u128, EXTRACTOR_ROLE, 0);
+        c.advance_epoch();
+
+        // Set sudah terpakai 9_900 dari kuota 10_000 -> sisa kuota = 100.
+        c.macro_state.epoch_treasury_spent = 9_900;
+        let bal_before = c.snacc_balances.get(&1).copied().unwrap();
+
+        // Fee = 10_000 -> raw_rebate = 200, tapi sisa kuota hanya 100 -> rebate dipotong jadi 100.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        assert_eq!(c.macro_state.epoch_treasury_spent, 10_000);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), bal_before + 100);
+
+        // Panggilan berikutnya saat kuota habis (spent == 10_000): rebate = 0, tidak panic!
+        let bal_after_cap = c.snacc_balances.get(&1).copied().unwrap();
+        let treasury_after_cap = c.treasury;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        assert_eq!(c.macro_state.epoch_treasury_spent, 10_000);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), bal_after_cap);
+        assert_eq!(c.treasury, treasury_after_cap + 10_000);
+    }
+
+    /// (4) `advance_epoch` mereset kuota `epoch_treasury_spent` dan menyalin `epoch_treasury_initial`.
+    #[test]
+    fn vc005_advance_epoch_reset_kuota() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000u128, EXTRACTOR_ROLE, 0);
+        c.macro_state.epoch_treasury_spent = 10_000;
+
+        c.advance_epoch();
+        assert_eq!(c.macro_state.current_epoch, 1);
+        assert_eq!(c.macro_state.epoch_treasury_spent, 0);
+        assert_eq!(c.macro_state.epoch_treasury_initial, c.treasury);
+
+        // Setelah advance_epoch, rebate kembali aktif di epoch baru.
+        let bal_before = c.snacc_balances.get(&1).copied().unwrap();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), bal_before + 200);
+        assert_eq!(c.macro_state.epoch_treasury_spent, 200);
+    }
+
+    /// (3) Zona tengah `600..=1400` netral: tanpa burn dan tanpa rebate.
+    #[test]
+    fn vc005_zona_tengah_netral() {
+        let mut c = SnaccContract::new();
+        // stake = 10_000 -> supply = 10_000, treasury = 2_000, strain = 8_000
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+
+        // Batas bawah zona tengah: fee = 6_000 -> temp = floor(1000 * 6_000 / 10_000) = 600 mK
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(6_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(6_000));
+        assert_eq!(c.get_crucible_temp(), 600);
+        assert_eq!(c.macro_state.total_snacc_burned, 0);
+        assert_eq!(c.macro_state.epoch_treasury_spent, 0);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
+        assert_eq!(c.treasury, 8_000);
+
+        // Batas atas zona tengah: tambah fee = 8_000 -> volume_epoch = 14_000 -> temp = 1400 mK
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(8_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(8_000));
+        assert_eq!(c.get_crucible_temp(), 1400);
+        assert_eq!(c.macro_state.total_snacc_burned, 0);
+        assert_eq!(c.macro_state.epoch_treasury_spent, 0);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
+        assert_eq!(c.treasury, 16_000);
+    }
+
+    /// (2) `get_macro_state` konsisten dengan `get_crucible_temp` & serialisasi JSON/Borsh.
+    #[test]
+    fn vc005_get_macro_state_dan_get_crucible_temp_konsisten() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(9_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(9_000));
+
+        let temp = c.get_crucible_temp();
+        let view = c.get_macro_state();
+        assert_eq!(temp, 900);
+        assert_eq!(view.crucible_temp, temp);
+        assert_eq!(view.total_snacc_supply, 10_000);
+        assert_eq!(view.volume_epoch, 9_000);
+
+        let json = serde_json::to_string(&view).unwrap();
+        let back: state::MacroStateView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+    }
+
+    /// (5) `ft_burn` membakar saldo `snacc_balances[strain_id]` dan menjaga invarian `I-01`.
+    #[test]
+    fn vc005_ft_burn_bakar_saldo_strain() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain=8_000, supply=10_000
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.ft_burn(1, U128(3_000));
+
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 5_000);
+        assert_eq!(c.macro_state.total_snacc_supply, 7_000);
+        assert_eq!(c.macro_state.total_snacc_burned, 3_000);
+        assert_eq!(c.get_strain(1).state_nonce, 1);
+    }
+
+    /// (5) `ft_burn` melebihi saldo strain -> ditolak `ERR_INSUFFICIENT_BALANCE`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn vc005_ft_burn_saldo_kurang_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain=8_000
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.ft_burn(1, U128(9_000));
+    }
+}
