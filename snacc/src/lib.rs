@@ -849,6 +849,83 @@ impl SnaccContract {
     }
 }
 
+
+// =====================================================================
+// VC-007 — `F5`: `splice_strains` — Voluntary Coasean Merger (`ADR-25`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `F5` / `P5` (`ADR-25`, `I-08`) — `splice_strains(dominant_id, absorbed_id)`.
+    ///
+    /// Pajak merger `2.5%` dari saldo `absorbed` ke `Rule-Bound Treasury`; sisa `97.5%`
+    /// `$SNACC` + `100%` sembilan molekul `NEP-245` + `role_mask` diserap `dominant`
+    /// (`dominant.role_mask |= absorbed.role_mask`, `I-08`), `generation + 1`,
+    /// `efficiency_bps + 800`; `absorbed` -> `SplicedBurned`.
+    /// TODO(EN-120): warisan set organel + wajib realokasi ATP; TODO(EN-124): cap `MAX_GENERATION`.
+    pub fn splice_strains(
+        &mut self,
+        dominant_id: StrainId,
+        absorbed_id: StrainId,
+    ) -> StrainVesselView {
+        assert_ne!(dominant_id, absorbed_id, "{}", constants::ERR_SAME_STRAIN);
+        let caller = env::predecessor_account_id();
+        let mut dom = self
+            .strains
+            .get(&dominant_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let mut abs = self
+            .strains
+            .get(&absorbed_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, dom.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert_eq!(caller, abs.owner_id, "{}", constants::ERR_NOT_SAME_OWNER);
+        assert!(
+            !matches!(
+                abs.status,
+                StrainStatus::SplicedBurned | StrainStatus::Liquidated
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        // Pajak merger `2.5%` (`250 bps`) dari saldo `absorbed` (`ADR-25`).
+        let abs_bal = self.snacc_balances.get(&absorbed_id).copied().unwrap_or(0);
+        let tax = abs_bal * constants::MERGER_TAX_BPS as u128 / constants::BPS_DENOMINATOR;
+        self.treasury = self.treasury.saturating_add(tax);
+        let dom_bal = self.snacc_balances.get(&dominant_id).copied().unwrap_or(0);
+        let _ = self
+            .snacc_balances
+            .insert(dominant_id, dom_bal.saturating_add(abs_bal - tax));
+        let _ = self.snacc_balances.insert(absorbed_id, 0);
+        // `100%` sembilan molekul `NEP-245` diserap ke `dominant`.
+        for token in constants::ALL_TOKEN_IDS {
+            let src = (absorbed_id, token.to_string());
+            let amount = self.inventories.get(&src).copied().unwrap_or(0);
+            if amount > 0 {
+                let _ = self.inventories.insert(src, 0);
+                let dst = (dominant_id, token.to_string());
+                let cur = self.inventories.get(&dst).copied().unwrap_or(0);
+                let _ = self.inventories.insert(dst, cur + amount);
+            }
+        }
+        // Bitmask `I-08`, `Gen + 1`, `+800 bps` efisiensi.
+        dom.role_mask |= abs.role_mask;
+        dom.generation = dom.generation.saturating_add(1);
+        dom.efficiency_bps = dom.efficiency_bps.saturating_add(800);
+        abs.status = StrainStatus::SplicedBurned;
+        dom.record_mutation();
+        abs.record_mutation();
+        let _ = self.strains.insert(dominant_id, dom);
+        let _ = self.strains.insert(absorbed_id, abs);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"strains_spliced","dominant_id":{},"absorbed_id":{},"merger_tax":{}}}"#,
+            dominant_id, absorbed_id, tax
+        ));
+        self.get_strain(dominant_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,5 +1682,81 @@ mod tests {
             TEE_SIG_HEX.to_string(),
             TEE_PUBKEY_HEX.to_string(),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // VC-007 — F5: splice_strains (Voluntary Coasean Merger, ADR-25)
+    // ------------------------------------------------------------------
+
+    fn vc007_pair(c: &mut SnaccContract) {
+        // strain 1 (Extractor) & strain 2 (Fermenter), stake 10_000 -> saldo 8_000 tiap.
+        let _ = call_incubate(c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(c, 10_000u128, FERMENTER_ROLE, 0);
+    }
+
+    /// (a) gabung aset: 97,5% $SNACC + 100% 9 molekul + pajak 2,5% ke treasury.
+    #[test]
+    fn vc007_splice_gabung_aset_dan_pajak() {
+        let mut c = SnaccContract::new();
+        vc007_pair(&mut c); // saldo 8_000 tiap; treasury 4_000 (20% x2)
+        let _ = c.inventories.insert((2, "mt:spore-ignis".to_string()), 5);
+        let _ = c.inventories.insert((2, "mt:enzyme-amalgam".to_string()), 3);
+        let _ = c.inventories.insert((2, "mt:elixir-aether".to_string()), 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.splice_strains(1, 2);
+        // pajak = 8000 * 250 / 10000 = 200; sisa 7800 -> dominant.
+        assert_eq!(c.snacc_balances.get(&1), Some(&15_800));
+        assert_eq!(c.snacc_balances.get(&2), Some(&0));
+        assert_eq!(c.treasury, 4_200);
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&5));
+        assert_eq!(c.inventories.get(&(1, "mt:enzyme-amalgam".to_string())), Some(&3));
+        assert_eq!(c.inventories.get(&(1, "mt:elixir-aether".to_string())), Some(&1));
+        assert_eq!(c.inventories.get(&(2, "mt:spore-ignis".to_string())), Some(&0));
+    }
+
+    /// (b) bitmask OR (`I-08`), `Gen+1`, `efficiency_bps +800`.
+    #[test]
+    fn vc007_bitmask_gen_efficiency() {
+        let mut c = SnaccContract::new();
+        vc007_pair(&mut c); // role 0b001 & 0b010
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.splice_strains(1, 2);
+        assert_eq!(v.role_mask, 0b011);
+        assert_eq!(v.generation, 1);
+        assert_eq!(v.efficiency_bps, 10_800); // 10000 + 800
+    }
+
+    /// (c) `absorbed` -> `SplicedBurned`; splice ulang ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_ALREADY_SPLICED")]
+    fn vc007_absorbed_burned_dan_tolak_ulang() {
+        let mut c = SnaccContract::new();
+        vc007_pair(&mut c);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.splice_strains(1, 2);
+        assert_eq!(c.get_strain(2).status, StrainStatus::SplicedBurned);
+        let _ = c.splice_strains(1, 2);
+    }
+
+    /// (d) pemilik berbeda -> `ERR_NOT_SAME_OWNER`.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_SAME_OWNER")]
+    fn vc007_beda_pemilik_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context("raider.testnet", NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(FERMENTER_ROLE), U128(10_000), 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.splice_strains(1, 2);
+    }
+
+    /// (e) id sama -> ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_SAME_STRAIN")]
+    fn vc007_id_sama_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.splice_strains(1, 1);
     }
 }

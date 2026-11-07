@@ -114,6 +114,22 @@ pub mod constants {
     pub const ERR_BAD_HEX: &str = "ERR_BAD_HEX";
     pub const ERR_BAD_SIGNATURE_LEN: &str = "ERR_BAD_SIGNATURE_LEN";
     pub const ERR_NOT_CONTRACT_OWNER: &str = "ERR_NOT_CONTRACT_OWNER";
+    /// `F5` — kode error merger (nama `ERR_NOT_SAME_OWNER` dari spec F5).
+    pub const ERR_NOT_SAME_OWNER: &str = "ERR_NOT_SAME_OWNER";
+    pub const ERR_SAME_STRAIN: &str = "ERR_SAME_STRAIN";
+    pub const ERR_STRAIN_ALREADY_SPLICED: &str = "ERR_STRAIN_ALREADY_SPLICED";
+    /// `F2`/`F5` — sembilan id molekul `NEP-245` (Katalog Molekul).
+    pub const ALL_TOKEN_IDS: [&str; 9] = [
+        "mt:spore-ignis",
+        "mt:spore-cryo",
+        "mt:spore-lumin",
+        "mt:enzyme-amalgam",
+        "mt:enzyme-redactase",
+        "mt:enzyme-synthase",
+        "mt:elixir-homunculus",
+        "mt:elixir-homeostasis",
+        "mt:elixir-aether",
+    ];
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
@@ -136,6 +152,8 @@ pub enum StrainStatus {
     Distressed,
     /// Tier 3: `0` — Cell Lysis (`harvest_starving_strain` terbuka).
     Liquidated,
+    /// `F5`: terserap habis oleh merger (`splice_strains`) — tidak dapat dipakai lagi.
+    SplicedBurned,
 }
 
 /// Kasta peran industri `Homunculus Strain` (`NEP-171`, `I-08`).
