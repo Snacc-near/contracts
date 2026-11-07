@@ -1,0 +1,16 @@
+[package]
+name = "snacc"
+version = "0.1.0"
+edition = "2021"
+# M1 snacc-core + M2 snacc-svg — kontrak tunggal atomik snacc-v001.near
+# (NEP-141 $SNACC + NEP-171/177 + NEP-245 + M&A + Lysis + TEE verify)
+# Spec: snacc-vault/04 Arsitektur/Snacc - Spec Antarmuka Kontrak.md
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.1"  # pin eksak — 5.30.x punya penjaga compile_error (lihat Kamus Angka Resmi)
+
+[dev-dependencies]
+near-sdk = { version = "=5.29.1", features = ["unit-testing"] }  # wajib untuk cargo test host (gerbang cfg near-sdk 5.29.x)
