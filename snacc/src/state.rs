@@ -96,6 +96,24 @@ pub mod constants {
     pub const ERR_INSUFFICIENT_BALANCE: &str = "ERR_INSUFFICIENT_BALANCE";
     pub const ERR_RECIPE_NOT_MET: &str = "ERR_RECIPE_NOT_MET";
     pub const ERR_REQUIRES_TEE_ATTESTATION: &str = "ERR_REQUIRES_TEE_ATTESTATION";
+    /// `F3` — model TEE verifikasi (Kamus Angka Resmi; pesan signed: `<model>:<req_sha256>:<res_sha256>`, `S2.6`).
+    pub const TEE_MODEL_ID: &str = "z-ai/glm-5.3-flash";
+    /// `I-03` — guardrail mutasi TEE.
+    pub const TEE_SHIFT_LIMIT_BPS: i64 = 1500;
+    pub const TEE_VITALITY_BONUS_CAP: u64 = 500;
+    /// `F3` — kode error TEE (nama mismatch diambil dari red-team spike `S1.9`).
+    pub const ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH: &str =
+        "ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH";
+    pub const ERR_COMMITMENT_MISMATCH: &str = "ERR_COMMITMENT_MISMATCH";
+    pub const ERR_COMMITMENT_ALREADY_PENDING: &str = "ERR_COMMITMENT_ALREADY_PENDING";
+    pub const ERR_SIGNER_NOT_REGISTERED: &str = "ERR_SIGNER_NOT_REGISTERED";
+    pub const ERR_TEE_REPLAY: &str = "ERR_TEE_REPLAY";
+    pub const ERR_PAYLOAD_STRAIN_MISMATCH: &str = "ERR_PAYLOAD_STRAIN_MISMATCH";
+    pub const ERR_GUARDRAIL_SHIFT: &str = "ERR_GUARDRAIL_SHIFT";
+    pub const ERR_GUARDRAIL_VITALITY: &str = "ERR_GUARDRAIL_VITALITY";
+    pub const ERR_BAD_HEX: &str = "ERR_BAD_HEX";
+    pub const ERR_BAD_SIGNATURE_LEN: &str = "ERR_BAD_SIGNATURE_LEN";
+    pub const ERR_NOT_CONTRACT_OWNER: &str = "ERR_NOT_CONTRACT_OWNER";
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
@@ -197,6 +215,10 @@ pub struct StrainVessel {
     pub pending_callbacks: u8,
     /// Energi internal (`EN-06`) — **non-transferable, bukan token**, tanpa `total_supply`.
     pub atp_balance: u128,
+    /// `F3` (`ADR-21`): komitmen `req_sha256_hex` Phase 1 (`commit_genome_experiment`).
+    pub pending_commitment: Option<String>,
+    /// `F3`: trait fenotip hasil mutasi TEE (payload `phenotype_trait`).
+    pub phenotype_trait: Option<String>,
     /// Generasi hasil `splice_strains`/`divide_strain` (`EN-08`, maks `MAX_GENERATION`).
     pub generation: u8,
     /// Set organel (`EN-07`); diwariskan saat merger = endosimbiosis (`EN-120`).
@@ -219,6 +241,8 @@ pub struct StrainVesselView {
     pub state_nonce: u64,
     pub pending_callbacks: u8,
     pub atp_balance: u128,
+    pub pending_commitment: Option<String>,
+    pub phenotype_trait: Option<String>,
     pub generation: u8,
     pub organel: OrganelleSlots,
     pub status: StrainStatus,
@@ -241,6 +265,8 @@ impl StrainVessel {
             state_nonce: self.state_nonce,
             pending_callbacks: self.pending_callbacks,
             atp_balance: self.atp_balance,
+            pending_commitment: self.pending_commitment.clone(),
+            phenotype_trait: self.phenotype_trait.clone(),
             generation: self.generation,
             organel: self.organel.clone(),
             status: self.status.clone(),
@@ -475,6 +501,8 @@ mod tests {
             state_nonce: 7,
             pending_callbacks: 0,
             atp_balance: 42,
+            pending_commitment: None,
+            phenotype_trait: None,
             generation: 0,
             organel: OrganelleSlots { mitokondria: 1, nukleus: 0, lisosom: 0 },
             status: StrainStatus::Active,
