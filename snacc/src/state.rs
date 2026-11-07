@@ -130,6 +130,9 @@ pub mod constants {
         "mt:elixir-homeostasis",
         "mt:elixir-aether",
     ];
+    /// `F6` — kode error Cell Lysis (nama dari spec F6 & Alur POV).
+    pub const ERR_STRAIN_NOT_INSOLVENT: &str = "ERR_STRAIN_NOT_INSOLVENT";
+    pub const ERR_ALREADY_LIQUIDATED: &str = "ERR_ALREADY_LIQUIDATED";
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
