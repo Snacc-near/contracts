@@ -12,12 +12,48 @@ pub mod state;
 pub mod svg;
 
 use near_sdk::json_types::U128;
+use near_sdk::serde::Deserialize;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
     constants, AlkemisProfile, MacroState, MacroStateView, MnaLogEntry, OrganelleSlots, StrainId,
     StrainRole, StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
 };
+
+/// Payload mutasi genom — `choices[0].message.content` (JSON di dalam JSON, `F3`/`I-03`).
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+struct MutationPayload {
+    strain_id: u64,
+    efficiency_shift_bps: i64,
+    vitality_bonus: u64,
+    #[serde(default)]
+    phenotype_trait: Option<String>,
+}
+
+/// Envelope respons chat (`/v1/chat/completions`) — ekstraksi `chat_id` anti-replay.
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+struct ChatEnvelope {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+struct ChatMessage {
+    content: String,
+}
 
 /// State kontrak — `D1–D8` (`D9` = event `NEP-297`, tanpa state). `VC-002`.
 #[near(contract_state)]
@@ -33,6 +69,10 @@ pub struct SnaccContract {
     pub tee_attestations: LookupMap<String, TeeAttestation>,
     /// `D5` Anti-replay: `chat_id` yang sudah dipakai (`used_tee_chat_ids`).
     pub used_tee_chat_ids: LookupSet<String>,
+    /// `D5`/`I-16` (`ADR-33`): registri kunci publik `ed25519` enclave TEE (`pubkey -> attested_at_sec`).
+    pub attested_tee_signers: LookupMap<[u8; 32], u64>,
+    /// Pemilik kontrak (gerbang `register_attested_signer`) — bootstrap saat registrasi pertama.
+    pub owner_id: Option<AccountId>,
     /// `D6` Kas `$SNACC` per Strain (neraca `vault_subaccount`).
     pub snacc_balances: LookupMap<StrainId, u128>,
     /// `D6` `Rule-Bound Treasury` — tanpa fungsi penarikan admin (`I-05`).
@@ -55,6 +95,8 @@ impl SnaccContract {
             inventories: LookupMap::new(b"i".to_vec()),
             tee_attestations: LookupMap::new(b"t".to_vec()),
             used_tee_chat_ids: LookupSet::new(b"u".to_vec()),
+            attested_tee_signers: LookupMap::new(b"p".to_vec()),
+            owner_id: None,
             snacc_balances: LookupMap::new(b"b".to_vec()),
             treasury: 0,
             macro_state: MacroState::default(),
@@ -134,6 +176,8 @@ impl SnaccContract {
             state_nonce: 0,
             pending_callbacks: 0,
             atp_balance: 0,
+            pending_commitment: None,
+            phenotype_trait: None,
             generation: 0,
             organel: OrganelleSlots::default(),
             status: StrainStatus::Active,
@@ -567,6 +611,241 @@ impl SnaccContract {
             strain_id, elixir_type, batches, enzymes_to_burn, snacc_catalyst_fee.0
         ));
         self.get_strain(strain_id)
+    }
+}
+
+
+// =====================================================================
+// VC-006 — `F3`: TEE zero-trust 2-fase (`ADR-21`) + guardrail `I-03`
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Dekode hex ke array tetap (`N` byte) — tanpa dependensi tambahan.
+    fn hex_to_bytes<const N: usize>(s: &str) -> [u8; N] {
+        assert_eq!(s.len(), N * 2, "{}", constants::ERR_BAD_HEX);
+        let b = s.as_bytes();
+        let nib = |c: u8| -> u8 {
+            match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => env::panic_str(constants::ERR_BAD_HEX),
+            }
+        };
+        let mut out = [0u8; N];
+        for (i, item) in out.iter_mut().enumerate() {
+            *item = (nib(b[2 * i]) << 4) | nib(b[2 * i + 1]);
+        }
+        out
+    }
+
+    fn hex_to_signature(s: &str) -> [u8; 64] {
+        assert_eq!(s.len(), 128, "{}", constants::ERR_BAD_SIGNATURE_LEN);
+        Self::hex_to_bytes::<64>(s)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    /// Verifikasi tanda tangan enclave atas `<model>:<req_sha256>:<res_sha256>` (`S2.6`).
+    /// Fungsi murni agar vektor signature **riil** dapat diuji langsung.
+    fn verify_tee_receipt(
+        req_sha256_hex: &str,
+        res_sha256_hex: &str,
+        signature_hex: &str,
+        tee_pubkey_hex: &str,
+    ) -> bool {
+        let sig = Self::hex_to_signature(signature_hex);
+        let pk = Self::hex_to_bytes::<32>(tee_pubkey_hex);
+        let msg = format!(
+            "{}:{}:{}",
+            constants::TEE_MODEL_ID,
+            req_sha256_hex,
+            res_sha256_hex
+        );
+        env::ed25519_verify(&sig, msg.as_bytes(), &pk)
+    }
+
+    /// Parse `choices[0].message.content` + guardrail `I-03` (dipisah agar dapat diuji).
+    fn parse_mutation_payload(raw_response_body: &str, strain_id: StrainId) -> MutationPayload {
+        let envelope: ChatEnvelope = near_sdk::serde_json::from_str(raw_response_body)
+            .unwrap_or_else(|_| {
+                env::panic_str(constants::ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH)
+            });
+        let content = envelope
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+        let payload: MutationPayload = near_sdk::serde_json::from_str(&content).unwrap_or_else(|_| {
+            env::panic_str(constants::ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH)
+        });
+        assert_eq!(
+            payload.strain_id, strain_id,
+            "{}",
+            constants::ERR_PAYLOAD_STRAIN_MISMATCH
+        );
+        assert!(
+            payload.efficiency_shift_bps.abs() <= constants::TEE_SHIFT_LIMIT_BPS,
+            "{}",
+            constants::ERR_GUARDRAIL_SHIFT
+        );
+        assert!(
+            payload.vitality_bonus <= constants::TEE_VITALITY_BONUS_CAP,
+            "{}",
+            constants::ERR_GUARDRAIL_VITALITY
+        );
+        payload
+    }
+
+    /// Kunci anti-replay: `chat_id`/`id` dari body; fallback `res_sha256` (unik per respons).
+    /// Ambiguitas terdokumentasi: nama field id respons tidak disebut spec.
+    fn extract_chat_key(raw_response_body: &str, res_sha256_hex: &str) -> String {
+        if let Ok(envelope) = near_sdk::serde_json::from_str::<ChatEnvelope>(raw_response_body) {
+            if let Some(id) = envelope.chat_id.or(envelope.id) {
+                if !id.is_empty() {
+                    return id;
+                }
+            }
+        }
+        res_sha256_hex.to_string()
+    }
+
+    /// `F3` / `P3` (`ADR-21`) — **Fase 1**: kunci komitmen `SHA-256` request
+    /// (`commit_genome_experiment`) sebelum memanggil enclave TEE.
+    pub fn commit_genome_experiment(&mut self, strain_id: StrainId, req_sha256_hex: String) {
+        let owner = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(owner, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert!(
+            v.pending_commitment.is_none(),
+            "{}",
+            constants::ERR_COMMITMENT_ALREADY_PENDING
+        );
+        let _ = Self::hex_to_bytes::<32>(&req_sha256_hex); // validasi format hex 32-byte
+        v.pending_commitment = Some(req_sha256_hex.clone());
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"genome_committed","strain_id":{},"req_sha256_hex":"{}"}}"#,
+            strain_id, req_sha256_hex
+        ));
+    }
+
+    /// `F3` / `P3` (`ADR-21`, `I-03`, `I-16`) — **Fase 2**: `apply_tee_mutation_zero_trust`.
+    ///
+    /// Ambiguitas terdokumentasi (keputusan `VC-006`): parameter `tee_pubkey_hex`
+    /// **ditambahkan** di luar tabel spec — verifikasi ke registri `attested_tee_signers`
+    /// (`I-16`) tidak mungkin tanpa kunci pemverifikasi.
+    pub fn apply_tee_mutation_zero_trust(
+        &mut self,
+        strain_id: StrainId,
+        req_sha256_hex: String,
+        raw_response_body: String,
+        signature_hex: String,
+        tee_pubkey_hex: String,
+    ) -> StrainVesselView {
+        let owner = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(owner, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        // Fase 1 binding: `pending_commitment` wajib cocok (`ADR-21`).
+        assert_eq!(
+            v.pending_commitment.as_deref(),
+            Some(req_sha256_hex.as_str()),
+            "{}",
+            constants::ERR_COMMITMENT_MISMATCH
+        );
+        v.pending_commitment = None;
+        // Hitung ulang `res_sha256` di on-chain (`ADR-21` — zero-trust).
+        let res_sha256_hex = Self::hex_encode(&env::sha256(raw_response_body.as_bytes()));
+        // `I-16` (`ADR-33`): kunci wajib terdaftar di `attested_tee_signers`.
+        let pk = Self::hex_to_bytes::<32>(&tee_pubkey_hex);
+        assert!(
+            self.attested_tee_signers.get(&pk).is_some(),
+            "{}",
+            constants::ERR_SIGNER_NOT_REGISTERED
+        );
+        // Verifikasi tanda tangan enclave atas `<model>:<req_sha256>:<res_sha256>`.
+        assert!(
+            Self::verify_tee_receipt(
+                &req_sha256_hex,
+                &res_sha256_hex,
+                &signature_hex,
+                &tee_pubkey_hex
+            ),
+            "{}",
+            constants::ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH
+        );
+        // Anti-replay (`D5`, `used_tee_chat_ids`).
+        let chat_key = Self::extract_chat_key(&raw_response_body, &res_sha256_hex);
+        assert!(
+            !self.used_tee_chat_ids.contains(&chat_key),
+            "{}",
+            constants::ERR_TEE_REPLAY
+        );
+        let _ = self.used_tee_chat_ids.insert(chat_key.clone());
+        // Parse payload + guardrail `I-03`, lalu terapkan mutasi ke Strain.
+        let payload = Self::parse_mutation_payload(&raw_response_body, strain_id);
+        v.efficiency_bps = (v.efficiency_bps as i64)
+            .saturating_add(payload.efficiency_shift_bps)
+            .clamp(0, u16::MAX as i64) as u16;
+        v.vitality = std::cmp::min(
+            constants::VITALITY_CAP,
+            v.vitality.saturating_add(payload.vitality_bonus),
+        );
+        if let Some(trait_name) = payload.phenotype_trait.clone() {
+            v.phenotype_trait = Some(trait_name);
+        }
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        let _ = self.tee_attestations.insert(
+            chat_key.clone(),
+            TeeAttestation {
+                chat_id: chat_key,
+                model: constants::TEE_MODEL_ID.to_string(),
+                req_sha256_hex,
+                res_sha256_hex,
+                signer_pubkey_hex: tee_pubkey_hex,
+            },
+        );
+        events::emit_event_json(&format!(
+            r#"{{"kind":"genome_mutated","strain_id":{},"efficiency_shift_bps":{},"vitality_bonus":{}}}"#,
+            strain_id, payload.efficiency_shift_bps, payload.vitality_bonus
+        ));
+        self.get_strain(strain_id)
+    }
+
+    /// `ADR-33` / `I-16` — registri kunci publik enclave TEE (`register_attested_signer`).
+    /// Ambiguitas terdokumentasi: spec tidak menyebut siapa yang mendaftarkan →
+    /// bootstrap: penelepon pertama menjadi `owner_id`; TODO(SEC-113) pengerasan.
+    pub fn register_attested_signer(&mut self, pubkey_hex: String, attested_at_sec: u64) {
+        let caller = env::predecessor_account_id();
+        if self.owner_id.is_none() {
+            self.owner_id = Some(caller.clone());
+        }
+        assert_eq!(
+            Some(&caller),
+            self.owner_id.as_ref(),
+            "{}",
+            constants::ERR_NOT_CONTRACT_OWNER
+        );
+        let pk = Self::hex_to_bytes::<32>(&pubkey_hex);
+        let _ = self.attested_tee_signers.insert(pk, attested_at_sec);
     }
 }
 
@@ -1164,5 +1443,167 @@ mod tests {
         let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain=8_000
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         c.ft_burn(1, U128(9_000));
+    }
+
+    // ------------------------------------------------------------------
+    // VC-006 — F3: TEE zero-trust 2-fase + guardrail I-03
+    // ------------------------------------------------------------------
+
+    // Vektor kriptografis RIAL dari NEAR AI Cloud TEE (spike `S1.8`/`S2.6`,
+    // `chat_id: c895b8f389fe45f3b369417a6de52536`) — diverifikasi `env::ed25519_verify`.
+    const TEE_REQ_SHA: &str =
+        "d06094a574a9e212b6756e3fb67457ec3a6fff9a4ff83fb3f48935e852569bb1";
+    const TEE_RES_SHA: &str =
+        "9014e73a4ed9d1c2234b4d04c4d0897330a9c2b52b10e60fb5b2e3d07f91a21c";
+    const TEE_PUBKEY_HEX: &str =
+        "5a0210f2442c79355784f9de021985429561da5bacc3a4424b01ac52b7e0caff";
+    const TEE_SIG_HEX: &str = "23f722d80dc1eb3b74a9523d57bb8e168700bc6fe6a22e97ad58254b3e353e0d05c04e4af4fa479a769cd18e0d5e44034a94c71370507a1c7f3fc75e2ce1c20d";
+
+    fn envelope(strain_id: u64, shift: i64, vitality_bonus: u64) -> String {
+        let content = format!(
+            r#"{{"strain_id":{},"efficiency_shift_bps":{},"vitality_bonus":{},"phenotype_trait":"Thermo-Aureate"}}"#,
+            strain_id, shift, vitality_bonus
+        );
+        format!(
+            r#"{{"id":"chat-abc","choices":[{{"message":{{"content":"{}"}}}}]}}"#,
+            content.replace('"', "\\\"")
+        )
+    }
+
+    /// (a) verifikasi signature RIAL (`env::ed25519_verify`) atas signed_text spike.
+    #[test]
+    fn vc006_signature_rial_vector_lulus() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        assert!(SnaccContract::verify_tee_receipt(
+            TEE_REQ_SHA,
+            TEE_RES_SHA,
+            TEE_SIG_HEX,
+            TEE_PUBKEY_HEX
+        ));
+    }
+
+    /// (a2) red-team `S1.9`: ubah 1 byte signature / hash -> verifikasi gagal.
+    #[test]
+    fn vc006_tamper_satu_byte_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let mut sig = TEE_SIG_HEX.to_string();
+        sig.replace_range(0..1, "0");
+        assert!(!SnaccContract::verify_tee_receipt(
+            TEE_REQ_SHA,
+            TEE_RES_SHA,
+            &sig,
+            TEE_PUBKEY_HEX
+        ));
+        assert!(!SnaccContract::verify_tee_receipt(
+            TEE_REQ_SHA,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            TEE_SIG_HEX,
+            TEE_PUBKEY_HEX
+        ));
+    }
+
+    /// (b) commit binding: `req_sha256` berbeda dari komitmen -> `ERR_COMMITMENT_MISMATCH`.
+    #[test]
+    #[should_panic(expected = "ERR_COMMITMENT_MISMATCH")]
+    fn vc006_komitmen_tidak_cocok_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.commit_genome_experiment(1, TEE_REQ_SHA.to_string());
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.apply_tee_mutation_zero_trust(
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            "{}".to_string(),
+            TEE_SIG_HEX.to_string(),
+            TEE_PUBKEY_HEX.to_string(),
+        );
+    }
+
+    /// (c) `I-16`: kunci tidak terdaftar -> `ERR_SIGNER_NOT_REGISTERED`.
+    #[test]
+    #[should_panic(expected = "ERR_SIGNER_NOT_REGISTERED")]
+    fn vc006_signer_tidak_terdaftar_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.commit_genome_experiment(1, TEE_REQ_SHA.to_string());
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.apply_tee_mutation_zero_trust(
+            1,
+            TEE_REQ_SHA.to_string(),
+            "{}".to_string(),
+            TEE_SIG_HEX.to_string(),
+            TEE_PUBKEY_HEX.to_string(),
+        );
+    }
+
+    /// (d) guardrail `I-03`: `efficiency_shift_bps` di luar ±1500 -> ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_GUARDRAIL_SHIFT")]
+    fn vc006_guardrail_shift_lebih_1500_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = SnaccContract::parse_mutation_payload(&envelope(1, 1501, 0), 1);
+    }
+
+    /// (d2) guardrail `I-03`: `vitality_bonus > 500` -> ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_GUARDRAIL_VITALITY")]
+    fn vc006_guardrail_vitality_lebih_500_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = SnaccContract::parse_mutation_payload(&envelope(1, 0, 501), 1);
+    }
+
+    /// (e) payload untuk strain lain -> `ERR_PAYLOAD_STRAIN_MISMATCH`.
+    #[test]
+    #[should_panic(expected = "ERR_PAYLOAD_STRAIN_MISMATCH")]
+    fn vc006_payload_strain_lain_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = SnaccContract::parse_mutation_payload(&envelope(2, 450, 200), 1);
+    }
+
+    /// (f) parse payload sah (vektor spike: +450 bps, +200 vitality, trait).
+    #[test]
+    fn vc006_parse_payload_sesuai_vektor_spike() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let p = SnaccContract::parse_mutation_payload(&envelope(1, 450, 200), 1);
+        assert_eq!(p.efficiency_shift_bps, 450);
+        assert_eq!(p.vitality_bonus, 200);
+        assert_eq!(p.phenotype_trait.as_deref(), Some("Thermo-Aureate"));
+    }
+
+    /// (g) registrasi signer: bootstrap owner pertama + non-owner ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_CONTRACT_OWNER")]
+    fn vc006_register_signer_hanya_owner() {
+        let mut c = SnaccContract::new();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.register_attested_signer(TEE_PUBKEY_HEX.to_string(), 1_700_000_000);
+        set_context("raider.testnet", NearToken::from_yoctonear(0));
+        c.register_attested_signer(
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            1_700_000_000,
+        );
+    }
+
+    /// (h) body palsu dengan signature rial -> `ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH`
+    /// (replikasi red-team `S1.9`: tidak ada jalan lolos tanpa body yang benar-benar ditandatangani).
+    #[test]
+    #[should_panic(expected = "ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH")]
+    fn vc006_apply_body_palsu_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.register_attested_signer(TEE_PUBKEY_HEX.to_string(), 1_700_000_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.commit_genome_experiment(1, TEE_REQ_SHA.to_string());
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.apply_tee_mutation_zero_trust(
+            1,
+            TEE_REQ_SHA.to_string(),
+            envelope(1, 450, 200),
+            TEE_SIG_HEX.to_string(),
+            TEE_PUBKEY_HEX.to_string(),
+        );
     }
 }
