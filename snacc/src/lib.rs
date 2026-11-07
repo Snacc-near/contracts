@@ -2012,4 +2012,33 @@ mod tests {
         let t = c.nft_token("1".to_string());
         assert!(t.metadata.media.starts_with("data:image/svg+xml;base64,"));
     }
+
+    // ------------------------------------------------------------------
+    // VC-010 — event NEP-297 ber-standard "snacc" (EVENT_JSON:)
+    // ------------------------------------------------------------------
+
+    /// (a) tiap aksi state memancarkan `EVENT_JSON` dengan `standard:"snacc"`.
+    /// Catatan: `testing_env!` meng-reset log, jadi log dicek per aksi.
+    #[test]
+    fn vc010_event_dipancarkan_per_aksi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 3); // -> strain_created
+        let l1 = near_sdk::test_utils::get_logs().join("\n");
+        assert!(l1.contains(r#""event":"strain_created""#), "strain_created hilang");
+        assert!(l1.contains(r#""standard":"snacc""#));
+
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(5));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(5)); // -> extracted
+        let l2 = near_sdk::test_utils::get_logs().join("\n");
+        assert!(l2.contains(r#""event":"extracted""#), "extracted hilang");
+
+        set_context_at(
+            "raider.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1); // -> strain_liquidated
+        let l3 = near_sdk::test_utils::get_logs().join("\n");
+        assert!(l3.contains(r#""event":"strain_liquidated""#), "strain_liquidated hilang");
+    }
 }
