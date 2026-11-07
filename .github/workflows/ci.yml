@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain (dipin rust-toolchain.toml: rustc 1.99.1)
+      - name: "Toolchain (dipin rust-toolchain.toml: rustc 1.99.1)"
         run: |
           rustup show
           rustup target add wasm32-unknown-unknown
