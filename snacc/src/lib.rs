@@ -73,6 +73,9 @@ pub struct SnaccContract {
     pub attested_tee_signers: LookupMap<[u8; 32], u64>,
     /// Pemilik kontrak (gerbang `register_attested_signer`) — bootstrap saat registrasi pertama.
     pub owner_id: Option<AccountId>,
+    /// `F6`: bounty likuidator per **akun pemanggil** (`D6` perluasan) —
+    /// TODO(NEP-141): digabung ke ledger token global saat tersedia.
+    pub account_balances: LookupMap<AccountId, u128>,
     /// `D6` Kas `$SNACC` per Strain (neraca `vault_subaccount`).
     pub snacc_balances: LookupMap<StrainId, u128>,
     /// `D6` `Rule-Bound Treasury` — tanpa fungsi penarikan admin (`I-05`).
@@ -97,6 +100,7 @@ impl SnaccContract {
             used_tee_chat_ids: LookupSet::new(b"u".to_vec()),
             attested_tee_signers: LookupMap::new(b"p".to_vec()),
             owner_id: None,
+            account_balances: LookupMap::new(b"l".to_vec()),
             snacc_balances: LookupMap::new(b"b".to_vec()),
             treasury: 0,
             macro_state: MacroState::default(),
@@ -937,6 +941,63 @@ impl SnaccContract {
             dominant_id, absorbed_id, tax
         ));
         self.get_strain(dominant_id)
+    }
+}
+
+
+// =====================================================================
+// VC-008 — `F6`: `harvest_starving_strain` — Cell Lysis (`ADR-11`, `I-10`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `F6` / `P6` (`ADR-11`, `ADR-26`, `I-10`) — `harvest_starving_strain(target_id)`.
+    ///
+    /// Permissionless; sah hanya saat `effective_vitality(target) == 0` (`Tier3Chapter7Insolvent`).
+    /// Split kas `90/10`: `10%` bounty `$SNACC` ke akun pemanggil, `90%` ke
+    /// `Rule-Bound Treasury`. Semua inventori molekul dibakar; `status -> Liquidated`.
+    /// TODO(EN-101/EN-102): `90%` bagian nutrient-burst akumulator; TODO(VC-009): SVG merah.
+    /// Ambiguitas terdokumentasi: bounty dikreditkan ke `account_balances` akun pemanggil
+    /// (spec F6: "dikreditkan ke akun pemanggil"; ledger NEP-141 global belum ada).
+    pub fn harvest_starving_strain(&mut self, target_id: StrainId) -> (U128, U128) {
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&target_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert!(
+            !matches!(v.status, StrainStatus::Liquidated | StrainStatus::SplicedBurned),
+            "{}",
+            constants::ERR_ALREADY_LIQUIDATED
+        );
+        // `I-10`: hanya `Tier3Chapter7Insolvent` (`effective_vitality == 0`).
+        assert_eq!(
+            v.effective_vitality(now_sec),
+            0,
+            "{}",
+            constants::ERR_STRAIN_NOT_INSOLVENT
+        );
+        let bal = self.snacc_balances.get(&target_id).copied().unwrap_or(0);
+        let bounty = bal * constants::LIQUIDATOR_BOUNTY_BPS as u128 / constants::BPS_DENOMINATOR;
+        let recovery = bal - bounty;
+        // `10%` bounty ke akun pemanggil; `90%` ke `Rule-Bound Treasury`.
+        let caller_bal = self.account_balances.get(&caller).copied().unwrap_or(0);
+        let _ = self.account_balances.insert(caller.clone(), caller_bal + bounty);
+        self.treasury = self.treasury.saturating_add(recovery);
+        let _ = self.snacc_balances.insert(target_id, 0);
+        // Inventori molekul dibakar habis (DK-054).
+        for token in constants::ALL_TOKEN_IDS {
+            let _ = self.inventories.insert((target_id, token.to_string()), 0);
+        }
+        v.status = StrainStatus::Liquidated;
+        v.record_mutation();
+        let _ = self.strains.insert(target_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"strain_liquidated","target_id":{},"liquidator":"{}","bounty":{},"treasury_recovery":{}}}"#,
+            target_id, caller, bounty, recovery
+        ));
+        (U128(bounty), U128(recovery))
     }
 }
 
@@ -1783,5 +1844,56 @@ mod tests {
         let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
         set_context("raider.testnet", NearToken::from_yoctonear(0));
         c.ft_burn(1, U128(1_000));
+    }
+
+    // ------------------------------------------------------------------
+    // VC-008 — F6: harvest_starving_strain (Cell Lysis, ADR-11 / I-10)
+    // ------------------------------------------------------------------
+
+    /// (a) split 90/10, permissionless, kas + inventori dibersihkan, status Liquidated.
+    #[test]
+    fn vc008_harvest_split_90_10() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // saldo 8_000; treasury 2_000
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 5);
+        // 200 jam x BMR 100 = 20000 > 8500 -> effective_vitality = 0.
+        set_context_at(
+            "raider.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let (bounty, recovery) = c.harvest_starving_strain(1);
+        assert_eq!(bounty.0, 800); // 10% dari 8_000
+        assert_eq!(recovery.0, 7_200); // 90%
+        assert_eq!(c.account_balances.get(&"raider.testnet".parse::<AccountId>().unwrap()), Some(&800));
+        assert_eq!(c.treasury, 9_200); // 2_000 + 7_200
+        assert_eq!(c.snacc_balances.get(&1), Some(&0));
+        assert_eq!(c.get_strain(1).status, StrainStatus::Liquidated);
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&0));
+    }
+
+    /// (b) `I-10`: target masih hidup -> `ERR_STRAIN_NOT_INSOLVENT`.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_NOT_INSOLVENT")]
+    fn vc008_target_masih_hidup_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context("raider.testnet", NearToken::from_yoctonear(0));
+        let _ = c.harvest_starving_strain(1);
+    }
+
+    /// (c) double harvest -> `ERR_ALREADY_LIQUIDATED`.
+    #[test]
+    #[should_panic(expected = "ERR_ALREADY_LIQUIDATED")]
+    fn vc008_double_harvest_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context_at(
+            "raider.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        let _ = c.harvest_starving_strain(1);
     }
 }
