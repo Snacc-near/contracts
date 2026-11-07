@@ -4,7 +4,6 @@
 //! `ADR-22/25/26/29`, dan **Kamus Angka Resmi** ([[Snacc - Model Data]]).
 //! Semua struct inti memakai `#[near(serializers = [borsh, json])]` (DoD `VC-002`).
 
-use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::{AccountId, near};
 
 pub type StrainId = u64;

@@ -12,13 +12,13 @@ pub mod state;
 pub mod svg;
 
 use near_sdk::store::{LookupMap, LookupSet, Vector};
-use near_sdk::{AccountId, near_bindgen, PanicOnDefault};
+use near_sdk::{near, AccountId, PanicOnDefault};
 use state::{
     AlkemisProfile, MacroState, MnaLogEntry, StrainId, StrainVessel, TeeAttestation, TokenId,
 };
 
 /// State kontrak — `D1–D8` (`D9` = event `NEP-297`, tanpa state). `VC-002`.
-#[near_bindgen]
+#[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct SnaccContract {
     /// `D1` Registry Alkemis.
@@ -41,7 +41,7 @@ pub struct SnaccContract {
     pub mna_logs: Vector<MnaLogEntry>,
 }
 
-#[near_bindgen]
+#[near]
 impl SnaccContract {
     #[init]
     pub fn new() -> Self {
