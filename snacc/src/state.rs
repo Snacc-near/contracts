@@ -38,6 +38,53 @@ pub mod constants {
     pub const MAX_GENERATION: u8 = 8;
     /// Batas atas diskon Nutrient Burst (`EN-01`, spec `0..2000`).
     pub const MAX_BURST_BPS: u16 = 2000;
+    /// `F1` — vitalitas awal Strain Genesis = `8500` (`85.00%`).
+    pub const INITIAL_VITALITY: u64 = 8500;
+    /// `F1` — efisiensi awal = `10000` bps (`1.00x`).
+    pub const INITIAL_EFFICIENCY_BPS: u16 = 10000;
+    /// `F1` — `bmr_per_hour` awal per kasta (`Katalog Molekul`).
+    pub const BMR_EXTRACTOR_PER_HOUR: u64 = 100;
+    pub const BMR_FERMENTER_PER_HOUR: u64 = 120;
+    pub const BMR_SYNTHESIZER_PER_HOUR: u64 = 150;
+    /// `ADR-25` / `I-08` — bitmask peran Coasean (wajib tunggal saat Genesis).
+    pub const ROLE_EXTRACTOR: u8 = 0b001;
+    pub const ROLE_FERMENTER: u8 = 0b010;
+    pub const ROLE_SYNTHESIZER: u8 = 0b100;
+    /// `F1` — `20%` fee inkubasi ke `Rule-Bound Treasury`; `80%` modal kerja Strain.
+    pub const STAKE_TREASURY_BPS: u128 = 2000;
+    pub const BPS_DENOMINATOR: u128 = 10000;
+    /// `F1` — deposit minimum `materialize_subaccount` = `0.02 NEAR` (20 milliNEAR).
+    pub const MIN_MATERIALIZE_DEPOSIT_MILLINEAR: u128 = 20;
+    /// `F1` — jumlah spora genesis yang dicetak per inkubasi (`Spec F1`, belum ternominalisasi).
+    pub const GENESIS_SPORE_AMOUNT: u64 = 1;
+    /// `F1` — format sub-account kanonik `s-<id>.snacc-v001.near`.
+    pub const VAULT_SUBACCOUNT_PREFIX: &str = "s-";
+    /// `F1` — kode error: strain sudah pernah diinkubasi.
+    pub const ERR_STRAIN_ALREADY_INCUBATED: &str = "ERR_STRAIN_ALREADY_INCUBATED";
+    /// `F1` — kode error: role bitmask bukan tunggal bit.
+    pub const ERR_ROLE_MASK_NOT_SINGLE: &str = "ERR_ROLE_MASK_NOT_SINGLE";
+    /// `F1` — kode error: deposit `materialize_subaccount` kurang dari 0.02 NEAR.
+    pub const ERR_INSUFFICIENT_DEPOSIT: &str = "ERR_INSUFFICIENT_DEPOSIT";
+    /// `F1` — kode error: pemanggil bukan owner strain.
+    pub const ERR_NOT_OWNED_BY_CALLEE: &str = "ERR_NOT_OWNED_BY_CALLEE";
+    /// `F1` — kode error: `initial_snacc_stake` nominal != attached deposit.
+    pub const ERR_STAKE_DEPOSIT_MISMATCH: &str = "ERR_STAKE_DEPOSIT_MISMATCH";
+    /// `F1` — kode error: strain tidak ditemukan.
+    pub const ERR_STRAIN_NOT_FOUND: &str = "ERR_STRAIN_NOT_FOUND";
+    /// `F1` — token spora genesis `NEP-245` (`Katalog Molekul`, `DFD P1.3`).
+    pub const GENESIS_SPORE_TOKEN_ID: &str = "mt:spore-ignis";
+    /// `ADR-02` — format sub-account kanonik `s-<id>.snacc-v001.near`.
+    pub const VAULT_SUBACCOUNT_SUFFIX: &str = ".snacc-v001.near";
+}
+
+/// Helper macro: panic with a constant `ERR_*` error code.
+/// `assert!`/`assert_eq!` require a string-literal format first, so we expose
+/// `fail!(err_code)` = `panic!(err_code)`.
+#[macro_export]
+macro_rules! fail {
+    ($err:expr) => {
+        panic!($err)
+    };
 }
 
 /// Status solvabilitas — tangga 3 tingkat (`ADR-26`).
@@ -50,6 +97,36 @@ pub enum StrainStatus {
     Distressed,
     /// Tier 3: `0` — Cell Lysis (`harvest_starving_strain` terbuka).
     Liquidated,
+}
+
+/// Kasta peran industri `Homunculus Strain` (`NEP-171`, `I-08`).
+/// Enum menjamin role tunggal saat Genesis; multi-bit hanya lewat `splice_strains`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StrainRole {
+    Extractor,
+    Fermenter,
+    Synthesizer,
+}
+
+impl StrainRole {
+    /// Bitmask Coasean tunggal (`ADR-25`): `0b001` / `0b010` / `0b100`.
+    pub const fn to_role_mask(self) -> u8 {
+        match self {
+            StrainRole::Extractor => constants::ROLE_EXTRACTOR,
+            StrainRole::Fermenter => constants::ROLE_FERMENTER,
+            StrainRole::Synthesizer => constants::ROLE_SYNTHESIZER,
+        }
+    }
+
+    /// `bmr_per_hour` awal per kasta (`F1`, `Katalog Molekul`): `100` / `120` / `150`.
+    pub const fn bmr_per_hour(self) -> u64 {
+        match self {
+            StrainRole::Extractor => constants::BMR_EXTRACTOR_PER_HOUR,
+            StrainRole::Fermenter => constants::BMR_FERMENTER_PER_HOUR,
+            StrainRole::Synthesizer => constants::BMR_SYNTHESIZER_PER_HOUR,
+        }
+    }
 }
 
 /// Slot organel (`EN-07`): MVP 3 slot — alokasi `$ATP` 1× per epoch.
@@ -85,6 +162,8 @@ pub struct StrainVessel {
     pub vault_subaccount: AccountId,
     /// Vitalitas (kanonik tangga: `0`, `1..=2000`, `>2000`).
     pub vitality: u64,
+    /// Efisiensi konversi `NEP-245` (`F2`): `10000 bps = 1.00x`.
+    pub efficiency_bps: u16,
     /// `BMR` — peluruhan vitalitas per jam (`ADR-22`).
     pub bmr_per_hour: u64,
     /// Timestamp (detik) pemberian makan terakhir.
@@ -104,7 +183,50 @@ pub struct StrainVessel {
     pub status: StrainStatus,
 }
 
+/// Tampilan baca-saja `get_strain` (`F1`) — mirror `StrainVessel` + `effective_vitality(now)`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrainVesselView {
+    pub strain_id: StrainId,
+    pub owner_id: AccountId,
+    pub vault_subaccount: AccountId,
+    pub vitality: u64,
+    pub efficiency_bps: u16,
+    pub bmr_per_hour: u64,
+    pub last_fed_sec: u64,
+    pub role_mask: u8,
+    pub state_nonce: u64,
+    pub pending_callbacks: u8,
+    pub atp_balance: u128,
+    pub generation: u8,
+    pub organel: OrganelleSlots,
+    pub status: StrainStatus,
+    /// Vitalitas efektif terhitung untuk `now` (Lazy BMR, `ADR-22`).
+    pub effective_vitality: u64,
+}
+
 impl StrainVessel {
+    /// Bangun view untuk `now_sec` (detik).
+    pub fn to_view(&self, now_sec: u64) -> StrainVesselView {
+        StrainVesselView {
+            strain_id: self.strain_id,
+            owner_id: self.owner_id.clone(),
+            vault_subaccount: self.vault_subaccount.clone(),
+            vitality: self.vitality,
+            efficiency_bps: self.efficiency_bps,
+            bmr_per_hour: self.bmr_per_hour,
+            last_fed_sec: self.last_fed_sec,
+            role_mask: self.role_mask,
+            state_nonce: self.state_nonce,
+            pending_callbacks: self.pending_callbacks,
+            atp_balance: self.atp_balance,
+            generation: self.generation,
+            organel: self.organel.clone(),
+            status: self.status.clone(),
+            effective_vitality: self.effective_vitality(now_sec),
+        }
+    }
+
     /// `effective_vitality = vitality - elapsed_hours * bmr_per_hour` (Lazy BMR).
     pub fn effective_vitality(&self, now_sec: u64) -> u64 {
         let elapsed_hours = now_sec.saturating_sub(self.last_fed_sec) / 3600;
@@ -249,6 +371,7 @@ mod tests {
             owner_id: "alkemis.testnet".parse().unwrap(),
             vault_subaccount: "s-1.snacc-v001.near".parse().unwrap(),
             vitality: 2500,
+            efficiency_bps: 10000,
             bmr_per_hour: 100,
             last_fed_sec: 3600,
             role_mask: 0b001,
