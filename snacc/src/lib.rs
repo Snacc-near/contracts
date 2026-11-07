@@ -325,6 +325,20 @@ impl SnaccContract {
     /// `F4` / `I-01` — bakar `$SNACC` dari neraca `snacc_balances[strain_id]`.
     /// TODO(VC-006/NEP-141): selaraskan signature `ft_burn(amount: U128)` saat ledger NEP-141 global tersedia.
     pub fn ft_burn(&mut self, strain_id: StrainId, amount: U128) {
+        // `SEC-101` (temuan `free-pi-cli` 2026-11-07): WAJIB cek pemanggil — hanya
+        // pemilik Strain (*pemegang token*) yang boleh membakar saldonya sendiri.
+        let owner = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .owner_id
+            .clone();
+        assert_eq!(
+            env::predecessor_account_id(),
+            owner,
+            "{}",
+            constants::ERR_NOT_OWNED_BY_CALLEE
+        );
         let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
         assert!(
             bal >= amount.0,
@@ -1758,5 +1772,16 @@ mod tests {
         let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         let _ = c.splice_strains(1, 1);
+    }
+
+    /// `SEC-101`: `ft_burn` oleh non-owner ditolak (temuan `free-pi-cli`: tanpa cek
+    /// pemanggil, siapa pun bisa membakar saldo Strain orang lain).
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn sec101_ft_burn_non_owner_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context("raider.testnet", NearToken::from_yoctonear(0));
+        c.ft_burn(1, U128(1_000));
     }
 }
