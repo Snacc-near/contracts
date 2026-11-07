@@ -16,8 +16,9 @@ use near_sdk::serde::Deserialize;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
-    constants, AlkemisProfile, MacroState, MacroStateView, MnaLogEntry, OrganelleSlots, StrainId,
-    StrainRole, StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
+    constants, AlkemisProfile, MacroState, MacroStateView, MnaLogEntry, NftMetadataView,
+    NftTokenView, OrganelleSlots, StrainId, StrainRole, StrainStatus, StrainVessel,
+    StrainVesselView, TeeAttestation, TokenId,
 };
 
 /// Payload mutasi genom — `choices[0].message.content` (JSON di dalam JSON, `F3`/`I-03`).
@@ -1001,6 +1002,77 @@ impl SnaccContract {
     }
 }
 
+
+// =====================================================================
+// VC-009 — `F7`: `nft_token` — Dynamic Base64 SVG (`NEP-171`/`NEP-177`, `ADR-03`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Zona makro dari suhu (kanonik: Fever `>1400`, Hypothermia `<600`, selain itu normal).
+    fn zone_of(temp_mk: u64) -> &'static str {
+        if temp_mk > constants::FEVER_THRESHOLD_MK {
+            "FEVER"
+        } else if temp_mk < constants::HYPOTHERMIA_THRESHOLD_MK {
+            "HYPO"
+        } else {
+            "NORMAL"
+        }
+    }
+
+    /// `F7` / `P7` (`ADR-03`) — `nft_token(token_id)` → `NEP-171`/`NEP-177` view
+    /// dengan `media = data:image/svg+xml;base64,...` berisi 8 indikator real-time
+    /// + `role_mask` & `generation` (spike `S1.5`), merah `#ff2255` bila `Liquidated`.
+    pub fn nft_token(&self, token_id: String) -> NftTokenView {
+        let strain_id: StrainId = token_id
+            .parse()
+            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        let v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND);
+        let now_ms = env::block_timestamp() / 1_000_000;
+        let now_sec = now_ms / 1000;
+        let balance = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        let bounty =
+            balance * constants::LIQUIDATOR_BOUNTY_BPS as u128 / constants::BPS_DENOMINATOR;
+        let temp = self.macro_state.crucible_temp_at(now_ms);
+        let liquidated = matches!(
+            v.status,
+            StrainStatus::Liquidated | StrainStatus::SplicedBurned
+        );
+        let svg = svg::render_strain_svg(
+            strain_id,
+            v.role_mask,
+            v.generation,
+            balance,
+            v.atp_balance,
+            v.organel.mitokondria,
+            v.organel.nukleus,
+            v.organel.lisosom,
+            now_sec.saturating_sub(v.last_fed_sec),
+            bounty,
+            temp,
+            Self::zone_of(temp),
+            liquidated,
+        );
+        NftTokenView {
+            token_id,
+            owner_id: v.owner_id.clone(),
+            metadata: NftMetadataView {
+                title: format!("Snacc Strain #{}", strain_id),
+                description: format!(
+                    "Living balance-sheet organism (role {}, gen {})",
+                    v.role_mask, v.generation
+                ),
+                media: format!(
+                    "data:image/svg+xml;base64,{}",
+                    svg::base64_encode(svg.as_bytes())
+                ),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1895,5 +1967,49 @@ mod tests {
         );
         let _ = c.harvest_starving_strain(1);
         let _ = c.harvest_starving_strain(1);
+    }
+
+    // ------------------------------------------------------------------
+    // VC-009 — F7: nft_token — Dynamic Base64 SVG (NEP-177, ADR-03)
+    // ------------------------------------------------------------------
+
+    /// (a) media = data URI base64, deterministik, payload wajar.
+    #[test]
+    fn vc009_nft_token_media_dan_deterministik() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let t1 = c.nft_token("1".to_string());
+        let t2 = c.nft_token("1".to_string());
+        assert_eq!(t1, t2);
+        assert!(t1.metadata.media.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(t1.token_id, "1");
+        assert_eq!(t1.owner_id.to_string(), ALKEMIS_ID);
+        assert!(t1.metadata.title.contains("Snacc Strain #1"));
+        // SVG ≤ 1.734 byte (diuji unit di svg.rs) -> base64 payload ≤ ±2.340 karakter.
+        assert!(t1.metadata.media.len() < 2_400, "media {} byte", t1.metadata.media.len());
+    }
+
+    /// (b) token id tidak valid / tidak ada -> `ERR_STRAIN_NOT_FOUND`.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_NOT_FOUND")]
+    fn vc009_nft_token_tidak_ada_ditolak() {
+        let c = SnaccContract::new();
+        let _ = c.nft_token("bukan-angka".to_string());
+    }
+
+    /// (c) strain terlikuidasi tetap bisa dirender (merah) via `nft_token`.
+    #[test]
+    fn vc009_nft_token_setelah_likuidasi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context_at(
+            "raider.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        let t = c.nft_token("1".to_string());
+        assert!(t.metadata.media.starts_with("data:image/svg+xml;base64,"));
     }
 }

@@ -466,6 +466,25 @@ impl MacroState {
     }
 }
 
+/// Metadata `NEP-177` (subset yang dibutuhkan wallet: title/description/media).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NftMetadataView {
+    pub title: String,
+    pub description: String,
+    /// `data:image/svg+xml;base64,...` (`F7`, `ADR-03`).
+    pub media: String,
+}
+
+/// View `nft_token` (`NEP-171`/`NEP-177`, `F7` — `VC-009`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NftTokenView {
+    pub token_id: String,
+    pub owner_id: AccountId,
+    pub metadata: NftMetadataView,
+}
+
 /// Bukti attestation TEE (`D5`) — disimpan dari `apply_tee_mutation_zero_trust` (`ADR-21`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
