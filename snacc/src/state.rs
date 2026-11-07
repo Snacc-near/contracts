@@ -246,8 +246,8 @@ mod tests {
     fn sample_strain() -> StrainVessel {
         StrainVessel {
             strain_id: 1,
-            owner_id: AccountId::new_unvalidated("alkemis.testnet".to_string()),
-            vault_subaccount: AccountId::new_unvalidated("s-1.snacc-v001.near".to_string()),
+            owner_id: "alkemis.testnet".parse().unwrap(),
+            vault_subaccount: "s-1.snacc-v001.near".parse().unwrap(),
             vitality: 2500,
             bmr_per_hour: 100,
             last_fed_sec: 3600,
