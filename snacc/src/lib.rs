@@ -247,6 +247,232 @@ impl SnaccContract {
             .expect(constants::ERR_STRAIN_NOT_FOUND);
         vessel.to_view(env::block_timestamp() / 1_000_000_000)
     }
+
+    // =====================================================================
+    // VC-004 — `F2`: rantai pasok 3-tahap `NEP-245` + Lazy BMR (`ADR-12/13`)
+    // =====================================================================
+
+    /// Gerbang `Lazy BMR` (`F2`): tolak bila `effective_vitality == 0` (`ERR_STRAIN_STARVING`).
+    fn assert_not_starving(v: &StrainVessel, now_sec: u64) -> u64 {
+        let eff = v.effective_vitality(now_sec);
+        assert!(eff > 0, "{}", constants::ERR_STRAIN_STARVING);
+        eff
+    }
+
+    /// Gerbang kasta: `role_mask` wajib memuat bit peran (`ERR_ROLE_NOT_ALLOWED`).
+    fn assert_role(v: &StrainVessel, role_bit: u8) {
+        assert!(
+            v.role_mask & role_bit != 0,
+            "{}",
+            constants::ERR_ROLE_NOT_ALLOWED
+        );
+    }
+
+    /// Katalis `$SNACC` (`F2`/`F4`): `assert` == attached deposit (`ERR_STAKE_DEPOSIT_MISMATCH`),
+    /// sementara masuk `treasury` + `macro_state.volume_epoch`.
+    /// TODO(VC-005): termostat `F4` (3,5% `ft_burn` / 2,0% rebate / 50% dividen).
+    fn take_catalyst_fee(&mut self, fee: &U128) {
+        assert_eq!(
+            env::attached_deposit().as_yoctonear(),
+            fee.0,
+            "{}",
+            constants::ERR_STAKE_DEPOSIT_MISMATCH
+        );
+        self.treasury = self.treasury.saturating_add(fee.0);
+        self.macro_state.volume_epoch = self.macro_state.volume_epoch.saturating_add(fee.0);
+    }
+
+    /// Pemulihan metabolik (`F2`): `vitality = min(10000, effective + 500)`, `last_fed_sec = now`.
+    fn recover_metabolism(v: &mut StrainVessel, eff: u64, now_sec: u64) {
+        v.vitality = std::cmp::min(
+            constants::VITALITY_CAP,
+            eff + constants::METABOLIC_RECOVERY_VITALITY,
+        );
+        v.last_fed_sec = now_sec;
+    }
+
+    fn inv_balance(&self, strain_id: StrainId, token: &str) -> u128 {
+        self.inventories
+            .get(&(strain_id, token.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `mt_burn` — kurangi inventori (`ERR_INSUFFICIENT_BALANCE` bila kurang).
+    fn inv_burn(&mut self, strain_id: StrainId, token: &str, amount: u128) {
+        let key = (strain_id, token.to_string());
+        let bal = self.inventories.get(&key).copied().unwrap_or(0);
+        assert!(bal >= amount, "{}", constants::ERR_INSUFFICIENT_BALANCE);
+        let _ = self.inventories.insert(key, bal - amount);
+    }
+
+    /// `mt_mint` — tambah inventori.
+    fn inv_mint(&mut self, strain_id: StrainId, token: &str, amount: u128) {
+        let key = (strain_id, token.to_string());
+        let bal = self.inventories.get(&key).copied().unwrap_or(0);
+        let _ = self.inventories.insert(key, bal + amount);
+    }
+
+    /// `F2` Tahap 1 — `extract_spores` (wajib `ROLE_EXTRACTOR`).
+    /// Ambiguitas terdokumentasi: jumlah hasil ekstraksi tidak ternominalisasi di spec
+    /// → **1 unit per panggilan** (keputusan review VC-004, 2026-11-07).
+    #[payable]
+    pub fn extract_spores(
+        &mut self,
+        strain_id: StrainId,
+        spore_type: String,
+        snacc_catalyst_fee: U128,
+    ) -> StrainVesselView {
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let eff = Self::assert_not_starving(&v, now_sec);
+        Self::assert_role(&v, constants::ROLE_EXTRACTOR);
+        assert!(
+            constants::SPORE_TOKEN_IDS.contains(&spore_type.as_str()),
+            "{}",
+            constants::ERR_UNKNOWN_TOKEN
+        );
+        self.take_catalyst_fee(&snacc_catalyst_fee);
+        self.inv_mint(strain_id, &spore_type, 1);
+        Self::recover_metabolism(&mut v, eff, now_sec);
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"extracted","strain_id":{},"token":"{}","amount":1,"catalyst_fee":{}}}"#,
+            strain_id, spore_type, snacc_catalyst_fee.0
+        ));
+        self.get_strain(strain_id)
+    }
+
+    /// `F2` Tahap 2 — `transmute_spores_to_enzyme` (`mt_burn` spora → `mt_mint` enzim
+    /// `floor(spores_to_burn * efficiency_bps / 10000)`, wajib `ROLE_FERMENTER`).
+    /// Ambiguitas terdokumentasi: signature tanpa jenis spora/enzim → dipetakan ke
+    /// **rasio resep per batch (2 spora)** dengan prioritas: amalgam → redactase → synthase.
+    #[payable]
+    pub fn transmute_spores_to_enzyme(
+        &mut self,
+        strain_id: StrainId,
+        spores_to_burn: u64,
+        snacc_catalyst_fee: U128,
+    ) -> StrainVesselView {
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let eff = Self::assert_not_starving(&v, now_sec);
+        Self::assert_role(&v, constants::ROLE_FERMENTER);
+        assert!(
+            spores_to_burn > 0 && spores_to_burn % 2 == 0,
+            "{}",
+            constants::ERR_RECIPE_NOT_MET
+        );
+        let burn = spores_to_burn as u128;
+        let k = burn / 2; // batch resep = 2 spora (Katalog Molekul)
+        let ignis = constants::SPORE_TOKEN_IDS[0];
+        let cryo = constants::SPORE_TOKEN_IDS[1];
+        let lumin = constants::SPORE_TOKEN_IDS[2];
+        // Prioritas resep: `amalgam` (2x ignis) → `redactase` (1x ignis + 1x lumin) → `synthase` (2x cryo).
+        let recipe: (&str, [(&str, u128); 2]) = if self.inv_balance(strain_id, ignis) >= burn {
+            (constants::ENZYME_AMALGAM, [(ignis, burn), ("", 0)])
+        } else if self.inv_balance(strain_id, ignis) >= k && self.inv_balance(strain_id, lumin) >= k {
+            (constants::ENZYME_REDACTASE, [(ignis, k), (lumin, k)])
+        } else if self.inv_balance(strain_id, cryo) >= burn {
+            (constants::ENZYME_SYNTHASE, [(cryo, burn), ("", 0)])
+        } else {
+            env::panic_str(constants::ERR_INSUFFICIENT_BALANCE)
+        };
+        self.take_catalyst_fee(&snacc_catalyst_fee);
+        for (token, amount) in recipe.1 {
+            if amount > 0 {
+                self.inv_burn(strain_id, token, amount);
+            }
+        }
+        let minted = burn * v.efficiency_bps as u128 / constants::BPS_DENOMINATOR;
+        self.inv_mint(strain_id, recipe.0, minted);
+        Self::recover_metabolism(&mut v, eff, now_sec);
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"transmuted","strain_id":{},"burned_spores":{},"token_out":"{}","minted":{},"catalyst_fee":{}}}"#,
+            strain_id, spores_to_burn, recipe.0, minted, snacc_catalyst_fee.0
+        ));
+        self.get_strain(strain_id)
+    }
+
+    /// `F2` Tahap 3 — `synthesize_elixir` (wajib `ROLE_SYNTHESIZER`).
+    /// `mt:elixir-aether` butuh Attestation TEE (TODO: `F3`/`DK-044`) →
+    /// untuk `VC-004` ditolak `ERR_REQUIRES_TEE_ATTESTATION`.
+    /// Ambiguitas terdokumentasi: jumlah output eliksir tidak ternominalisasi →
+    /// **1 eliksir per batch resep** (`enzymes_to_burn` harus kelipatan batch).
+    #[payable]
+    pub fn synthesize_elixir(
+        &mut self,
+        strain_id: StrainId,
+        elixir_type: String,
+        enzymes_to_burn: u64,
+        snacc_catalyst_fee: U128,
+    ) -> StrainVesselView {
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let eff = Self::assert_not_starving(&v, now_sec);
+        Self::assert_role(&v, constants::ROLE_SYNTHESIZER);
+        // Resep per batch (Katalog Molekul): (enzim_a, per_a, enzim_b, per_b, batch_total).
+        let recipe: (&str, u128, &str, u128, u128) = match elixir_type.as_str() {
+            constants::ELIXIR_HOMUNCULUS => (
+                constants::ENZYME_AMALGAM,
+                2,
+                constants::ENZYME_SYNTHASE,
+                1,
+                3,
+            ),
+            constants::ELIXIR_HOMEOSTASIS => (
+                constants::ENZYME_AMALGAM,
+                1,
+                constants::ENZYME_REDACTASE,
+                1,
+                2,
+            ),
+            constants::ELIXIR_AETHER => env::panic_str(constants::ERR_REQUIRES_TEE_ATTESTATION),
+            _ => env::panic_str(constants::ERR_UNKNOWN_TOKEN),
+        };
+        let (enz_a, per_a, enz_b, per_b, batch_total) = recipe;
+        assert!(
+            enzymes_to_burn > 0 && enzymes_to_burn as u128 % batch_total == 0,
+            "{}",
+            constants::ERR_RECIPE_NOT_MET
+        );
+        let batches = enzymes_to_burn as u128 / batch_total;
+        let need_a = per_a * batches;
+        let need_b = per_b * batches;
+        assert!(
+            self.inv_balance(strain_id, enz_a) >= need_a
+                && self.inv_balance(strain_id, enz_b) >= need_b,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+        self.take_catalyst_fee(&snacc_catalyst_fee);
+        self.inv_burn(strain_id, enz_a, need_a);
+        self.inv_burn(strain_id, enz_b, need_b);
+        self.inv_mint(strain_id, &elixir_type, batches);
+        Self::recover_metabolism(&mut v, eff, now_sec);
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"synthesized","strain_id":{},"token_out":"{}","minted":{},"enzymes_burned":{},"catalyst_fee":{}}}"#,
+            strain_id, elixir_type, batches, enzymes_to_burn, snacc_catalyst_fee.0
+        ));
+        self.get_strain(strain_id)
+    }
 }
 
 #[cfg(test)]
@@ -258,11 +484,15 @@ mod tests {
 
     /// Konteks test resmi near-sdk 5 (`testing_env!` + `VMContextBuilder`).
     fn set_context(predecessor: &str, deposit: NearToken) {
+        set_context_at(predecessor, deposit, 3_600_000_000_000); // 1 jam — Lazy BMR terkendali
+    }
+
+    fn set_context_at(predecessor: &str, deposit: NearToken, block_timestamp: u64) {
         let mut builder = VMContextBuilder::new();
         builder
             .predecessor_account_id(predecessor.parse().unwrap())
             .attached_deposit(deposit)
-            .block_timestamp(3_600_000_000_000); // 1 jam — Lazy BMR terkendali
+            .block_timestamp(block_timestamp);
         testing_env!(builder.build());
     }
 
@@ -472,6 +702,171 @@ mod tests {
         let mut c = SnaccContract::new();
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         let _ = c.incubate_strain(role(EXTRACTOR_ROLE), U128(0), 0);
+    }
+
+    // ----------------------------------------------------------------------
+    // VC-004 — F2: extract_spores / transmute_spores_to_enzyme / synthesize_elixir
+    // ----------------------------------------------------------------------
+
+    fn grant(c: &mut SnaccContract, token: &str, amount: u128) {
+        let _ = c.inventories.insert((1, token.to_string()), amount);
+    }
+
+    /// (a) Lazy BMR: vitality habis -> `ERR_STRAIN_STARVING`.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_STARVING")]
+    fn vc004_starving_gate_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        // 200 jam x BMR 100/jam = 20000 > vitality 8500 -> effective 0.
+        set_context_at(
+            ALKEMIS_ID,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(0));
+    }
+
+    /// (b) role gate: Extractor tidak boleh transmute.
+    #[test]
+    #[should_panic(expected = "ERR_ROLE_NOT_ALLOWED")]
+    fn vc004_role_gate_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+    }
+
+    /// (c) extract mint 1 spore sesuai jenis.
+    #[test]
+    fn vc004_extract_mint_sesuai_jenis() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 3); // genesis 3 ignis
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(7));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(7));
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&4));
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.extract_spores(1, "mt:spore-cryo".to_string(), U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:spore-cryo".to_string())), Some(&1));
+        // baseline treasury = 20% stake inkubasi (2e11) + katalis 7.
+        assert_eq!(c.treasury, 200_000_000_000 + 7); // TODO VC-005: termostat
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_UNKNOWN_TOKEN")]
+    fn vc004_extract_token_tak_dikenal_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.extract_spores(1, "mt:bogus".to_string(), U128(0));
+    }
+
+    /// (d) transmute burn -> mint x efficiency_bps (10000 = 1:1; 5000 = 0,5x).
+    #[test]
+    fn vc004_transmute_formula_efficiency() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, FERMENTER_ROLE, 0);
+        grant(&mut c, "mt:spore-ignis", 10);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.transmute_spores_to_enzyme(1, 4, U128(0));
+        assert_eq!(v.efficiency_bps, 10000);
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&6));
+        assert_eq!(c.inventories.get(&(1, "mt:enzyme-amalgam".to_string())), Some(&4));
+        // ubah efficiency jadi 5000 -> output 0,5x
+        let mut vessel = c.strains.get(&1).unwrap().clone();
+        vessel.efficiency_bps = 5000;
+        let _ = c.strains.insert(1, vessel);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 4, U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:enzyme-amalgam".to_string())), Some(&6));
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&2));
+    }
+
+    /// (e) resep enzim: redactase (ignis+lumin) & synthase (cryo).
+    #[test]
+    fn vc004_transmute_resep_redactase_synthase() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, FERMENTER_ROLE, 0);
+        grant(&mut c, "mt:spore-ignis", 1);
+        grant(&mut c, "mt:spore-lumin", 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:enzyme-redactase".to_string())), Some(&2));
+        grant(&mut c, "mt:spore-cryo", 2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:enzyme-synthase".to_string())), Some(&2));
+    }
+
+    /// (e) resep tak terpenuhi (jumlah ganjil) -> `ERR_RECIPE_NOT_MET`.
+    #[test]
+    #[should_panic(expected = "ERR_RECIPE_NOT_MET")]
+    fn vc004_transmute_resep_tak_terpenuhi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, FERMENTER_ROLE, 0);
+        grant(&mut c, "mt:spore-ignis", 10);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 3, U128(0));
+    }
+
+    /// (h) stok kurang -> `ERR_INSUFFICIENT_BALANCE`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn vc004_stok_spora_kurang_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, FERMENTER_ROLE, 0);
+        grant(&mut c, "mt:spore-ignis", 2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 4, U128(0));
+    }
+
+    /// (e) eliksir: homunculus (2 amalgam + 1 synthase) & homeostasis (1+1) per batch.
+    #[test]
+    fn vc004_synthesize_resep_eliksir() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, SYNTHESIZER_ROLE, 0);
+        grant(&mut c, "mt:enzyme-amalgam", 4);
+        grant(&mut c, "mt:enzyme-synthase", 2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.synthesize_elixir(1, "mt:elixir-homunculus".to_string(), 6, U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:elixir-homunculus".to_string())), Some(&2));
+        grant(&mut c, "mt:enzyme-amalgam", 2);
+        grant(&mut c, "mt:enzyme-redactase", 2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.synthesize_elixir(1, "mt:elixir-homeostasis".to_string(), 4, U128(0));
+        assert_eq!(c.inventories.get(&(1, "mt:elixir-homeostasis".to_string())), Some(&2));
+    }
+
+    /// (f) aether butuh TEE -> `ERR_REQUIRES_TEE_ATTESTATION`.
+    #[test]
+    #[should_panic(expected = "ERR_REQUIRES_TEE_ATTESTATION")]
+    fn vc004_aether_ditolak_tanpa_tee() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, SYNTHESIZER_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.synthesize_elixir(1, "mt:elixir-aether".to_string(), 3, U128(0));
+    }
+
+    /// (g) pemulihan metabolik: vitality +500 & last_fed reset.
+    #[test]
+    fn vc004_pemulihan_metabolik() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(0));
+        // effective 8500 (1 jam belum menurunkan 1 penuh), +500 -> 9000.
+        assert_eq!(v.vitality, 9000);
+        assert_eq!(v.last_fed_sec, 3600);
+    }
+
+    /// katalis: deposit != nominal -> `ERR_STAKE_DEPOSIT_MISMATCH`.
+    #[test]
+    #[should_panic(expected = "ERR_STAKE_DEPOSIT_MISMATCH")]
+    fn vc004_katalis_mismatch_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(5));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(9));
     }
 }
 

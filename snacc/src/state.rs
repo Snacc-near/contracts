@@ -75,6 +75,27 @@ pub mod constants {
     pub const GENESIS_SPORE_TOKEN_ID: &str = "mt:spore-ignis";
     /// `ADR-02` — format sub-account kanonik `s-<id>.snacc-v001.near`.
     pub const VAULT_SUBACCOUNT_SUFFIX: &str = ".snacc-v001.near";
+    /// `F2` — pemulihan metabolik per transmutasi sukses: `vitality +500`.
+    pub const METABOLIC_RECOVERY_VITALITY: u64 = 500;
+    /// `I-02` — batas atas vitalitas (`0..=10000`).
+    pub const VITALITY_CAP: u64 = 10000;
+    /// `F2` — id token `NEP-245` Tahap 1 (spora).
+    pub const SPORE_TOKEN_IDS: [&str; 3] = ["mt:spore-ignis", "mt:spore-cryo", "mt:spore-lumin"];
+    /// `F2` — id token Tahap 2 (enzim, resep Katalog Molekul).
+    pub const ENZYME_AMALGAM: &str = "mt:enzyme-amalgam";
+    pub const ENZYME_REDACTASE: &str = "mt:enzyme-redactase";
+    pub const ENZYME_SYNTHASE: &str = "mt:enzyme-synthase";
+    /// `F2` — id token Tahap 3 (eliksir).
+    pub const ELIXIR_HOMUNCULUS: &str = "mt:elixir-homunculus";
+    pub const ELIXIR_HOMEOSTASIS: &str = "mt:elixir-homeostasis";
+    pub const ELIXIR_AETHER: &str = "mt:elixir-aether";
+    /// `F2` — kode error rantai pasok.
+    pub const ERR_STRAIN_STARVING: &str = "ERR_STRAIN_STARVING";
+    pub const ERR_UNKNOWN_TOKEN: &str = "ERR_UNKNOWN_TOKEN";
+    pub const ERR_ROLE_NOT_ALLOWED: &str = "ERR_ROLE_NOT_ALLOWED";
+    pub const ERR_INSUFFICIENT_BALANCE: &str = "ERR_INSUFFICIENT_BALANCE";
+    pub const ERR_RECIPE_NOT_MET: &str = "ERR_RECIPE_NOT_MET";
+    pub const ERR_REQUIRES_TEE_ATTESTATION: &str = "ERR_REQUIRES_TEE_ATTESTATION";
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
