@@ -17,13 +17,14 @@ use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
     constants, AlkemisProfile, Epoch, FeederEntry, MacroState, MacroStateView, MacroZone,
-    MnaLogEntry, NftMetadataView, NftTokenView, OrganelleSlots, StrainId, StrainRole,
-    StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
+    MnaLogEntry, NftMetadataView, NftTokenView, NpcMerchantAgent, NpcQuoteView, OrganelleSlots,
+    StrainId, StrainRole, StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
 };
 
 /// Payload mutasi genom — `choices[0].message.content` (JSON di dalam JSON, `F3`/`I-03`).
+/// DK-074 — skema ketat: field asing ditolak (`deny_unknown_fields`).
 #[derive(Deserialize)]
-#[serde(crate = "near_sdk::serde")]
+#[serde(crate = "near_sdk::serde", deny_unknown_fields)]
 struct MutationPayload {
     strain_id: u64,
     efficiency_shift_bps: i64,
@@ -31,6 +32,11 @@ struct MutationPayload {
     #[serde(default)]
     phenotype_trait: Option<String>,
 }
+
+/// DK-074 — `phenotype_trait` maksimal 32 karakter (spec Diagram Konseptual).
+/// Daftar putih lengkap belum terdefinisi di vault — panjang ditegakkan di sini;
+/// whitelist menyusul bila spec memancang daftarnya (keputusan tercatat).
+const TEE_TRAIT_MAX_CHARS: usize = 32;
 
 /// Envelope respons chat (`/v1/chat/completions`) — ekstraksi `chat_id` anti-replay.
 #[derive(Deserialize)]
@@ -44,6 +50,10 @@ struct ChatEnvelope {
     choices: Vec<ChatChoice>,
 }
 
+// CATATAN DK-074: envelope/choice (format gateway) sengaja TOLERAN — field gateway
+// bisa bertambah (index, finish_reason, logprobs, …) tanpa merusak verifikasi.
+// Skema KETAT (deny_unknown_fields) ditegakkan pada MutationPayload — payload
+// keputusan itulah yang menjadi permukaan serangan.
 #[derive(Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 struct ChatChoice {
@@ -93,6 +103,8 @@ pub struct SnaccContract {
     pub feast_contributions: LookupMap<(Epoch, AccountId), u128>,
     /// `EN-107` — leaderboard top-3 feeder per epoch (batas 3 entri, gas aman).
     pub epoch_top_feeders: LookupMap<Epoch, Vec<FeederEntry>>,
+    /// `ADR-30` — 3 NPC pedagang otonom on-chain (`D4`).
+    pub npc_agents: LookupMap<String, NpcMerchantAgent>,
     /// `D6` Kas `$SNACC` per Strain (neraca `vault_subaccount`).
     pub snacc_balances: LookupMap<StrainId, u128>,
     /// `D6` `Rule-Bound Treasury` — tanpa fungsi penarikan admin (`I-05`).
@@ -103,33 +115,82 @@ pub struct SnaccContract {
     pub mna_logs: Vector<MnaLogEntry>,
     /// `F1` — counter `StrainId` berurutan mulai `1`.
     pub next_strain_id: StrainId,
+    /// SEC-112/migrate — generasi prefix collection (naik tiap `migrate()`;
+    /// collection baru memakai `[gen, base]` → data lama tak terbaca).
+    pub prefix_gen: u8,
 }
+
+const GEN_MARKER: &[u8] = b"__snacc_prefix_gen_v1";
+/// SEC-113 — marker owner raw-storage (bertahan lintas migrate, di luar collection).
+const OWNER_MARKER: &[u8] = b"__snacc_owner_v1";
+/// DK-073 — batas ukuran respons TEE (spec: "mis. ≤4 KB").
+const TEE_MAX_RESPONSE_BYTES: usize = 4096;
 
 #[near]
 impl SnaccContract {
-    #[init]
-    pub fn new() -> Self {
+    /// Bangun contract state dengan prefix `[gen, base]` — SEC-112/migrate.
+    fn build(gen: u8) -> Self {
+        let px = |b: u8| vec![gen, b];
         Self {
-            alchemists: LookupMap::new(b"a".to_vec()),
-            strains: LookupMap::new(b"s".to_vec()),
-            inventories: LookupMap::new(b"i".to_vec()),
-            tee_attestations: LookupMap::new(b"t".to_vec()),
-            used_tee_chat_ids: LookupSet::new(b"u".to_vec()),
-            attested_tee_signers: LookupMap::new(b"p".to_vec()),
+            prefix_gen: gen,
+            alchemists: LookupMap::new(px(97)),
+            strains: LookupMap::new(px(115)),
+            inventories: LookupMap::new(px(105)),
+            tee_attestations: LookupMap::new(px(116)),
+            used_tee_chat_ids: LookupSet::new(px(117)),
+            attested_tee_signers: LookupMap::new(px(112)),
             owner_id: None,
-            account_balances: LookupMap::new(b"l".to_vec()),
-            strains_by_owner: LookupMap::new(b"o".to_vec()),
-            registered_storage: LookupMap::new(b"r".to_vec()),
-            epoch_dividend_rate: LookupMap::new(b"e".to_vec()),
-            epoch_aether_burned: LookupMap::new(b"f".to_vec()),
-            dividend_claimed: LookupSet::new(b"g".to_vec()),
-            feast_contributions: LookupMap::new(b"h".to_vec()),
-            epoch_top_feeders: LookupMap::new(b"k".to_vec()),
-            snacc_balances: LookupMap::new(b"b".to_vec()),
+            account_balances: LookupMap::new(px(108)),
+            strains_by_owner: LookupMap::new(px(111)),
+            registered_storage: LookupMap::new(px(114)),
+            epoch_dividend_rate: LookupMap::new(px(101)),
+            epoch_aether_burned: LookupMap::new(px(102)),
+            dividend_claimed: LookupSet::new(px(103)),
+            feast_contributions: LookupMap::new(px(104)),
+            epoch_top_feeders: LookupMap::new(px(107)),
+            npc_agents: LookupMap::new(px(110)),
+            snacc_balances: LookupMap::new(px(98)),
             treasury: 0,
             macro_state: MacroState::default(),
-            mna_logs: Vector::new(b"m".to_vec()),
+            mna_logs: Vector::new(px(109)),
             next_strain_id: 1,
+        }
+    }
+
+    #[init]
+    pub fn new() -> Self {
+        // gen=0 → prefix [0, base] — sudah BERBEDA dari kontrak pra-gen (bare [base])
+        // sehingga data lama tak terbaca meski tanpa marker. Marker hanya untuk migrate.
+        // SEC-113 — owner ditetapkan SAAT deploy (deployer), bukan penelepon pertama
+        // method mana pun (polanya membuka pengambilalihan owner).
+        let mut c = Self::build(0);
+        c.owner_id = Some(env::predecessor_account_id());
+        env::storage_write(OWNER_MARKER, c.owner_id.as_ref().unwrap().as_bytes());
+        c.spawn_npcs();
+        c
+    }
+
+    /// `ADR-30` — seed 3 NPC otonom (`D4` Model Data): stok genesis = stok target
+    /// (keputusan tercatat), reserve 0, harga dasar `NPC_P_BASE`.
+    fn spawn_npcs(&mut self) {
+        for (npc_id, archetype, target) in [
+            ("npc-extractor", "Pyre-X", constants::NPC_TARGET_EXTRACTOR),
+            ("npc-central-arb", "Myco-7", constants::NPC_TARGET_CENTRAL_ARB),
+            ("npc-vulture-ma", "Void-0", constants::NPC_TARGET_VULTURE),
+        ] {
+            let _ = self.npc_agents.insert(
+                npc_id.to_string(),
+                NpcMerchantAgent {
+                    npc_id: npc_id.to_string(),
+                    wallet_account: format!("{}.snacc-v001.near", npc_id),
+                    role_archetype: archetype.to_string(),
+                    snacc_reserve: 0,
+                    spores_stock: target,
+                    target_spores_stock: target,
+                    base_spore_price: constants::NPC_P_BASE,
+                    trades_executed: 0,
+                },
+            );
         }
     }
 
@@ -187,10 +248,12 @@ impl SnaccContract {
         let strain_id = self.next_strain_id;
         self.next_strain_id += 1;
 
-        let vault_subaccount: AccountId =
-            format!("s-{}{}", strain_id, constants::VAULT_SUBACCOUNT_SUFFIX)
-                .parse()
-                .unwrap();
+        // Pipeline #7 — suffix diturunkan dari akun kontrak (parent SELALU ada):
+        // hardcode ".snacc-v001.near" gagal di testnet (parent tak terdaftar ->
+        // `create_account` pasti gagal on-chain).
+        let vault_subaccount: AccountId = format!("s-{}.{}", strain_id, env::current_account_id())
+            .parse()
+            .unwrap();
 
         let vessel = StrainVessel {
             strain_id,
@@ -203,17 +266,18 @@ impl SnaccContract {
             role_mask,
             state_nonce: 0,
             pending_callbacks: 0,
-            atp_balance: 0,
+            atp_balance: constants::INITIAL_ATP,
             pending_commitment: None,
             phenotype_trait: None,
             generation: 0,
             organel: OrganelleSlots::default(),
+            last_allocate_epoch: u64::MAX,
             status: StrainStatus::Active,
         };
 
         // `D2` ledger, `D6` neraca internal & treasury, `D7` suplai `$SNACC` (`I-01`).
         let _ = self.strains.insert(strain_id, vessel.clone());
-        let _ = self.snacc_balances.insert(strain_id, to_strain);
+        self.set_strain_snacc(strain_id, to_strain);
         self.treasury += to_treasury;
         self.macro_state.total_snacc_supply += stake;
         if self.macro_state.current_epoch == 0 {
@@ -228,6 +292,8 @@ impl SnaccContract {
             .inventories
             .insert(spore_key, spores + initial_spores as u128);
 
+        // `EN-124` — counter demografi: inkubasi = birth.
+        self.macro_state.total_births = self.macro_state.total_births.saturating_add(1);
         // `D9` — emit NEP-297 `strain_created`.
         events::emit_event_json(&format!(
             r#"{{"kind":"strain_created","strain_id":{},"owner_id":"{}","role_mask":{},"initial_snacc_stake":{},"spores_minted":{}}}"#,
@@ -252,7 +318,7 @@ impl SnaccContract {
         match self.strains_by_owner.get_mut(&owner_id) {
             Some(owned) => owned.push(strain_id),
             None => {
-                let mut owned = Vector::new(format!("o:{}", owner_id).into_bytes());
+                let mut owned = Vector::new(format!("o:{}:{}", self.prefix_gen, owner_id).into_bytes());
                 owned.push(strain_id);
                 let _ = self.strains_by_owner.insert(owner_id, owned);
             }
@@ -267,7 +333,8 @@ impl SnaccContract {
         let vessel = self
             .strains
             .get(&strain_id)
-            .expect(constants::ERR_STRAIN_NOT_FOUND);
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
         let owner_id = vessel.owner_id.clone();
         assert_eq!(
             env::predecessor_account_id(),
@@ -282,8 +349,17 @@ impl SnaccContract {
             "ERR_INSUFFICIENT_DEPOSIT"
         );
 
+        // SEC-111 (triase Opsi a) — kunci `pending_callbacks` menjadi NYATA: set 1
+        // selama promise window; `assert_atomic_ready` menolak mutasi M&A di tengah
+        // window; reset 0 di callback `on_subaccount_created` (semua jalur).
+        let mut locked = vessel.clone();
+        locked.pending_callbacks = 1;
+        locked.record_mutation();
+        let _ = self.strains.insert(strain_id, locked);
+
+        // Pipeline #7 — suffix = akun kontrak (parent selalu ada di jaringannya).
         let sub_id: AccountId =
-            format!("s-{}{}", strain_id, constants::VAULT_SUBACCOUNT_SUFFIX)
+            format!("s-{}.{}", strain_id, env::current_account_id())
                 .parse()
                 .unwrap();
 
@@ -310,6 +386,12 @@ impl SnaccContract {
         owner_id: AccountId,
         deposit_yocto: U128,
     ) {
+        // SEC-111 — lepas kunci `pending_callbacks` di SEMUA jalur (window tertutup).
+        if let Some(mut v) = self.strains.get(&strain_id).cloned() {
+            v.pending_callbacks = 0;
+            v.record_mutation();
+            let _ = self.strains.insert(strain_id, v);
+        }
         if env::promise_result_checked(0, usize::MAX).is_err() {
             let _ = Promise::new(owner_id).transfer(NearToken::from_yoctonear(deposit_yocto.0));
             near_sdk::log!(
@@ -440,7 +522,7 @@ impl SnaccContract {
             "{}",
             constants::ERR_INSUFFICIENT_BALANCE
         );
-        let _ = self.snacc_balances.insert(strain_id, bal - amount.0);
+        self.set_strain_snacc(strain_id, bal - amount.0);
         self.macro_state.total_snacc_supply = self
             .macro_state
             .total_snacc_supply
@@ -471,6 +553,56 @@ impl SnaccContract {
     // =====================================================================
     // VC-004 — `F2`: rantai pasok 3-tahap `NEP-245` + Lazy BMR (`ADR-12/13`)
     // =====================================================================
+
+    /// Pipeline #6 — SATU-SATUNYA jalur tulis `snacc_balances`: memelihara agregat
+    /// `sum_strain_snacc` untuk invarian `V-04` (LookupMap tak bisa diiterasi).
+    fn set_strain_snacc(&mut self, strain_id: StrainId, new_bal: u128) {
+        let old = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        let delta = new_bal as i128 - old as i128;
+        self.macro_state.sum_strain_snacc =
+            (self.macro_state.sum_strain_snacc as i128 + delta).max(0) as u128;
+        let _ = self.snacc_balances.insert(strain_id, new_bal);
+    }
+
+    /// Pipeline #6 — jalur tulis `account_balances` + agregat `sum_account_balances`.
+    fn set_account_balance(&mut self, account: &AccountId, new_bal: u128) {
+        let old = self.account_balances.get(account).copied().unwrap_or(0);
+        let delta = new_bal as i128 - old as i128;
+        self.macro_state.sum_account_balances =
+            (self.macro_state.sum_account_balances as i128 + delta).max(0) as u128;
+        let _ = self.account_balances.insert(account.clone(), new_bal);
+    }
+
+    /// `EN-114`/§13a — potong ATP strain; `ERR_NOT_ENOUGH_ATP` bila kurang.
+    /// ATP non-transferable: hanya dipakai sebagai biaya kerja internal.
+    fn pay_atp(v: &mut StrainVessel, cost: u128) {
+        assert!(
+            v.atp_balance >= cost,
+            "{}",
+            constants::ERR_NOT_ENOUGH_ATP
+        );
+        v.atp_balance -= cost;
+    }
+
+    /// `EN-115`/§13a — `atp_minted = (fee / ATP_YOCTO_UNIT) × efficiency_bps/10000
+    /// × (10000 + 1000 × level_mitokondria)/10000` (mitokondria +10%/level).
+    /// Catatan: komponen `zona` pada EN-06 tidak termasuk (§13a final tanpa zona).
+    fn calc_atp_minted(fee_yocto: u128, efficiency_bps: u16, level_mitokondria: u8) -> u128 {
+        let base = fee_yocto / constants::ATP_YOCTO_UNIT;
+        base * u128::from(efficiency_bps) / constants::BPS_DENOMINATOR
+            * u128::from(10_000 + 1_000 * u16::from(level_mitokondria))
+            / constants::BPS_DENOMINATOR
+    }
+
+    /// `ECON-111` FINAL — tambah kaki K2/K3 `V_epoch` (econ-report-3 §1):
+    /// `unit × VOLUME_SCALE(5) × P_BASE(100)` untuk mt_burn & mt_mint.
+    /// K4 (kas likuidasi) ditambahkan langsung di `harvest_starving_strain`.
+    fn add_volume_legs(&mut self, burn_units: u128, mint_units: u128) {
+        let legs = (burn_units + mint_units)
+            * constants::VOLUME_SCALE
+            * constants::P_BASE;
+        self.macro_state.volume_epoch = self.macro_state.volume_epoch.saturating_add(legs);
+    }
 
     /// Gerbang `Lazy BMR` (`F2`): tolak bila `effective_vitality == 0` (`ERR_STRAIN_STARVING`).
     fn assert_not_starving(v: &StrainVessel, now_sec: u64) -> u64 {
@@ -505,20 +637,33 @@ impl SnaccContract {
             "{}",
             constants::ERR_STAKE_DEPOSIT_MISMATCH
         );
-        self.apply_thermostat_fee(strain_id, fee.0);
+        // Pipeline #6 — fee EKSTERNAL (attached NEAR-yocto) = inflow nyata untuk V-04;
+        // fee feed_strain INTERNAL tidak dihitung (lihat catatan SEC-112/VI di atas).
+        self.macro_state.total_catalyst_fees = self
+            .macro_state
+            .total_catalyst_fees
+            .saturating_add(fee.0);
+        self.apply_thermostat_fee(strain_id, fee.0, 0);
     }
 
     /// Jalur termostat untuk fee internal (`feed_strain` `EN-103`): sama seperti
     /// `take_catalyst_fee` tanpa asersi attached deposit.
-    fn apply_thermostat_fee(&mut self, strain_id: StrainId, fee: u128) {
+    fn apply_thermostat_fee(&mut self, strain_id: StrainId, fee: u128, extra_volume: u128) {
+        // CATATAN SEC-112/VI: `total_catalyst_fees` hanya menghitung fee EKSTERNAL
+        // (attached yocto — lewat `take_catalyst_fee`); fee `feed_strain` INTERNAL
+        // (dari saldo strain) tidak dihitung inflow (sudah konservasi internal).
         let now_ms = env::block_timestamp() / 1_000_000;
         let v_decayed = self.macro_state.decayed_volume(now_ms);
-        self.macro_state.volume_epoch = v_decayed.saturating_add(fee);
+        // EN-117 (keputusan pemilik: suhu literal ATP) — `extra_volume` =
+        // `atp_minted × ATP_VOLUME_SCALE` dari feed; masuk V_epoch epoch yang sama.
+        self.macro_state.volume_epoch = v_decayed
+            .saturating_add(fee)
+            .saturating_add(extra_volume);
         self.macro_state.last_update_ms = now_ms;
 
         let temp = self.get_crucible_temp();
         // `EN-106` — deteksi transisi zona makro → event `zone_changed` (tanpa keeper).
-        let zone = Self::zone_at(temp);
+        let zone = self.zone_at(temp);
         if zone != self.macro_state.last_zone {
             events::emit_event_json(&format!(
                 r#"{{"kind":"zone_changed","from_zone":"{}","to_zone":"{}","crucible_temp":{}}}"#,
@@ -529,8 +674,16 @@ impl SnaccContract {
             self.macro_state.last_zone = zone;
         }
         if temp > self.macro_state.params.fever_threshold_mk {
-            let burn = fee * self.macro_state.params.fever_burn_bps as u128
-                / constants::BPS_DENOMINATOR;
+            // `LC-11` — pelindung `mt:elixir-homeostasis` (katalog molekul): pemegang
+            // >=1 unit mendapat diskon 50% pada burn Fever — PER STRAIN (keputusan
+            // tercatat; eliksir tidak dikonsumsi, efek pasif).
+            let burn = if self.inv_balance(strain_id, constants::ELIXIR_HOMEOSTASIS) >= 1 {
+                fee * u128::from(self.macro_state.params.fever_burn_bps) * 50
+                    / (100 * constants::BPS_DENOMINATOR)
+            } else {
+                fee * u128::from(self.macro_state.params.fever_burn_bps)
+                    / constants::BPS_DENOMINATOR
+            };
             self.macro_state.total_snacc_supply =
                 self.macro_state.total_snacc_supply.saturating_sub(burn);
             self.macro_state.total_snacc_burned =
@@ -551,9 +704,7 @@ impl SnaccContract {
                 self.treasury = self.treasury.saturating_sub(rebate);
                 if rebate > 0 {
                     let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
-                    let _ = self
-                        .snacc_balances
-                        .insert(strain_id, bal.saturating_add(rebate));
+                    self.set_strain_snacc(strain_id, bal.saturating_add(rebate));
                     self.macro_state.epoch_treasury_spent =
                         self.macro_state.epoch_treasury_spent.saturating_add(rebate);
                 }
@@ -634,8 +785,15 @@ impl SnaccContract {
             "{}",
             constants::ERR_UNKNOWN_TOKEN
         );
+        // `EN-116`/§13a — biaya ATP extract = 1.
+        Self::pay_atp(&mut v, 1);
         self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
         self.inv_mint(strain_id, &spore_type, 1);
+        // `ECON-111` — kaki K3: mt_mint 1 unit spora.
+        self.add_volume_legs(0, 1);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"extract","cost":1}}"#, strain_id
+        ));
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
@@ -666,7 +824,7 @@ impl SnaccContract {
         let eff = Self::assert_not_starving(&v, now_sec);
         Self::assert_role(&v, constants::ROLE_FERMENTER);
         assert!(
-            spores_to_burn > 0 && spores_to_burn % 2 == 0,
+            spores_to_burn > 0 && spores_to_burn.is_multiple_of(2),
             "{}",
             constants::ERR_RECIPE_NOT_MET
         );
@@ -690,7 +848,7 @@ impl SnaccContract {
         // −20%; lainnya 0. Multi-role (hasil splice): cukup satu bit cocok.
         // `snacc_catalyst_fee` = nominal; attached deposit wajib = fee SETELAH diskon.
         let temp_now = self.get_crucible_temp();
-        let diet_bps: u16 = match Self::zone_at(temp_now) {
+        let diet_bps: u16 = match self.zone_at(temp_now) {
             MacroZone::Fever if v.role_mask & constants::ROLE_EXTRACTOR != 0 => {
                 constants::DIET_FEVER_EXTRACTOR_BPS
             }
@@ -701,14 +859,27 @@ impl SnaccContract {
         };
         let effective_fee =
             snacc_catalyst_fee.0 * u128::from(10000 - diet_bps) / constants::BPS_DENOMINATOR;
+        // `EN-116`/§13a — biaya ATP transmute = 2.
+        Self::pay_atp(&mut v, 2);
         self.take_catalyst_fee(strain_id, &U128(effective_fee));
         for (token, amount) in recipe.1 {
             if amount > 0 {
                 self.inv_burn(strain_id, token, amount);
             }
         }
-        let minted = burn * v.efficiency_bps as u128 / constants::BPS_DENOMINATOR;
+        // EN-119 — Nukleus: output produksi +10%/level (keputusan pemilik 2026-11-08).
+        let nuk_bps = u128::from(v.organel.nukleus)
+            * constants::NUCLEUS_OUTPUT_BPS_PER_LEVEL;
+        let minted = burn
+            * u128::from(v.efficiency_bps)
+            * (constants::BPS_DENOMINATOR + nuk_bps)
+            / (constants::BPS_DENOMINATOR * constants::BPS_DENOMINATOR);
         self.inv_mint(strain_id, recipe.0, minted);
+        // `ECON-111` — kaki K2 (spora dibakar) & K3 (enzim di-mint).
+        self.add_volume_legs(burn, minted);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"transmute","cost":2}}"#, strain_id
+        ));
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
@@ -771,7 +942,7 @@ impl SnaccContract {
         };
         let (enz_a, per_a, enz_b, per_b, batch_total) = recipe;
         assert!(
-            enzymes_to_burn > 0 && enzymes_to_burn as u128 % batch_total == 0,
+            enzymes_to_burn > 0 && (enzymes_to_burn as u128).is_multiple_of(batch_total),
             "{}",
             constants::ERR_RECIPE_NOT_MET
         );
@@ -784,16 +955,29 @@ impl SnaccContract {
             "{}",
             constants::ERR_INSUFFICIENT_BALANCE
         );
+        // `EN-116`/§13a — biaya ATP synthesize = 3.
+        Self::pay_atp(&mut v, 3);
         self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
         self.inv_burn(strain_id, enz_a, need_a);
         self.inv_burn(strain_id, enz_b, need_b);
-        self.inv_mint(strain_id, &elixir_type, batches);
+        // EN-119 — Nukleus: output eliksir +10%/level (keputusan pemilik).
+        let nuk_bps = u128::from(v.organel.nukleus)
+            * constants::NUCLEUS_OUTPUT_BPS_PER_LEVEL;
+        let minted_elixir = batches
+            * (constants::BPS_DENOMINATOR + nuk_bps)
+            / constants::BPS_DENOMINATOR;
+        self.inv_mint(strain_id, &elixir_type, minted_elixir);
+        // `ECON-111` — kaki K2 (enzim dibakar) & K3 (eliksir di-mint).
+        self.add_volume_legs(enzymes_to_burn as u128, batches);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"synthesize","cost":3}}"#, strain_id
+        ));
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
         events::emit_event_json(&format!(
             r#"{{"kind":"synthesized","strain_id":{},"token_out":"{}","minted":{},"enzymes_burned":{},"catalyst_fee":{}}}"#,
-            strain_id, elixir_type, batches, enzymes_to_burn, snacc_catalyst_fee.0
+            strain_id, elixir_type, minted_elixir, enzymes_to_burn, snacc_catalyst_fee.0
         ));
         self.get_strain(strain_id)
     }
@@ -887,6 +1071,13 @@ impl SnaccContract {
             "{}",
             constants::ERR_GUARDRAIL_VITALITY
         );
+        if let Some(trait_name) = &payload.phenotype_trait {
+            assert!(
+                trait_name.chars().count() <= TEE_TRAIT_MAX_CHARS,
+                "{}",
+                constants::ERR_TEE_TRAIT_INVALID
+            );
+        }
         payload
     }
 
@@ -956,6 +1147,13 @@ impl SnaccContract {
             constants::ERR_COMMITMENT_MISMATCH
         );
         v.pending_commitment = None;
+        // DK-073 — batas ukuran respons diperiksa PALING AWAL (sebelum hash/sig)
+        // agar body raksasa tidak menghabiskan gas hash/parse.
+        assert!(
+            raw_response_body.len() <= TEE_MAX_RESPONSE_BYTES,
+            "{}",
+            constants::ERR_TEE_RESPONSE_TOO_LARGE
+        );
         // Hitung ulang `res_sha256` di on-chain (`ADR-21` — zero-trust).
         let res_sha256_hex = Self::hex_encode(&env::sha256(raw_response_body.as_bytes()));
         // `I-16` (`ADR-33`): kunci wajib terdaftar di `attested_tee_signers`.
@@ -1016,13 +1214,11 @@ impl SnaccContract {
     }
 
     /// `ADR-33` / `I-16` — registri kunci publik enclave TEE (`register_attested_signer`).
-    /// Ambiguitas terdokumentasi: spec tidak menyebut siapa yang mendaftarkan →
-    /// bootstrap: penelepon pertama menjadi `owner_id`; TODO(SEC-113) pengerasan.
+    /// SEC-113 — hanya pemilik kontrak (owner ditetapkan saat deploy/migrate);
+    /// pola first-caller-becomes-owner DIHAPUS. Menimpa kunci terdaftar dengan
+    /// attestation berbeda ditolak (tidak diam-diam, `I-16`).
     pub fn register_attested_signer(&mut self, pubkey_hex: String, attested_at_sec: u64) {
         let caller = env::predecessor_account_id();
-        if self.owner_id.is_none() {
-            self.owner_id = Some(caller.clone());
-        }
         assert_eq!(
             Some(&caller),
             self.owner_id.as_ref(),
@@ -1030,7 +1226,42 @@ impl SnaccContract {
             constants::ERR_NOT_CONTRACT_OWNER
         );
         let pk = Self::hex_to_bytes::<32>(&pubkey_hex);
+        if let Some(old) = self.attested_tee_signers.get(&pk) {
+            assert_eq!(
+                *old, attested_at_sec,
+                "{}",
+                constants::ERR_TEE_SIGNER_OVERWRITE
+            );
+        }
         let _ = self.attested_tee_signers.insert(pk, attested_at_sec);
+        // DK-070 — event `signer_added` (nama persis dari spec Diagram Konseptual).
+        events::emit_event_json(&format!(
+            r#"{{"kind":"signer_added","pubkey_hex":"{}","attested_at_sec":{}}}"#,
+            pubkey_hex, attested_at_sec
+        ));
+    }
+
+    /// DK-070 — `remove_attested_signer`: hanya pemilik kontrak; kunci harus
+    /// terdaftar; event `signer_removed` (nama persis dari spec).
+    pub fn remove_attested_signer(&mut self, pubkey_hex: String) {
+        let caller = env::predecessor_account_id();
+        assert_eq!(
+            Some(&caller),
+            self.owner_id.as_ref(),
+            "{}",
+            constants::ERR_NOT_CONTRACT_OWNER
+        );
+        let pk = Self::hex_to_bytes::<32>(&pubkey_hex);
+        assert!(
+            self.attested_tee_signers.get(&pk).is_some(),
+            "{}",
+            constants::ERR_TEE_SIGNER_NOT_FOUND
+        );
+        let _ = self.attested_tee_signers.remove(&pk);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"signer_removed","pubkey_hex":"{}"}}"#,
+            pubkey_hex
+        ));
     }
 }
 
@@ -1079,10 +1310,8 @@ impl SnaccContract {
         let tax = abs_bal * constants::MERGER_TAX_BPS as u128 / constants::BPS_DENOMINATOR;
         self.treasury = self.treasury.saturating_add(tax);
         let dom_bal = self.snacc_balances.get(&dominant_id).copied().unwrap_or(0);
-        let _ = self
-            .snacc_balances
-            .insert(dominant_id, dom_bal.saturating_add(abs_bal - tax));
-        let _ = self.snacc_balances.insert(absorbed_id, 0);
+        self.set_strain_snacc(dominant_id, dom_bal.saturating_add(abs_bal - tax));
+        self.set_strain_snacc(absorbed_id, 0);
         // `100%` sembilan molekul `NEP-245` diserap ke `dominant`.
         for token in constants::ALL_TOKEN_IDS {
             let src = (absorbed_id, token.to_string());
@@ -1098,11 +1327,26 @@ impl SnaccContract {
         dom.role_mask |= abs.role_mask;
         dom.generation = dom.generation.saturating_add(1);
         dom.efficiency_bps = dom.efficiency_bps.saturating_add(800);
+        // `EN-116`/§13a — biaya ATP merger = 5 (dipotong dari dominan).
+        Self::pay_atp(&mut dom, 5);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"splice","cost":5}}"#, dominant_id
+        ));
+        // `EN-120` — endosimbiosis: tiap slot organel = max(dominan, terserap);
+        // realokasi ATP dibuka kembali (`last_allocate_epoch` di-reset).
+        dom.organel = OrganelleSlots {
+            mitokondria: dom.organel.mitokondria.max(abs.organel.mitokondria),
+            nukleus: dom.organel.nukleus.max(abs.organel.nukleus),
+            lisosom: dom.organel.lisosom.max(abs.organel.lisosom),
+        };
+        dom.last_allocate_epoch = u64::MAX;
         abs.status = StrainStatus::SplicedBurned;
         dom.record_mutation();
         abs.record_mutation();
         let _ = self.strains.insert(dominant_id, dom);
         let _ = self.strains.insert(absorbed_id, abs);
+        // `EN-124` — counter demografi: splice = merger.
+        self.macro_state.total_mergers = self.macro_state.total_mergers.saturating_add(1);
         events::emit_event_json(&format!(
             r#"{{"kind":"strains_spliced","dominant_id":{},"absorbed_id":{},"merger_tax":{}}}"#,
             dominant_id, absorbed_id, tax
@@ -1199,10 +1443,8 @@ impl SnaccContract {
         // Split pembayaran: 95% ke pemilik lama, 5% ke treasury (`ADR-26`).
         let seller_payout = payment * constants::HOSTILE_SELLER_BPS / constants::BPS_DENOMINATOR;
         let treasury_cut = payment - seller_payout;
-        let _ = self
-            .snacc_balances
-            .insert(raider_strain_id, raider_bal - payment + target_bal);
-        let _ = self.snacc_balances.insert(distressed_target_id, 0);
+        self.set_strain_snacc(raider_strain_id, raider_bal - payment + target_bal);
+        self.set_strain_snacc(distressed_target_id, 0);
         let seller = self
             .account_balances
             .get(&target.owner_id)
@@ -1227,6 +1469,19 @@ impl SnaccContract {
         raider.role_mask |= target.role_mask;
         raider.generation = raider.generation.saturating_add(1);
         raider.efficiency_bps = raider.efficiency_bps.max(target.efficiency_bps);
+        // `EN-116`/§13a — biaya ATP takeover = 10 (dipotong dari raider).
+        Self::pay_atp(&mut raider, 10);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"hostile","cost":10}}"#, raider_strain_id
+        ));
+        // `EN-120` — endosimbiosis hostile: organel = max per slot; realokasi ATP
+        // dibuka kembali (`last_allocate_epoch` di-reset).
+        raider.organel = OrganelleSlots {
+            mitokondria: raider.organel.mitokondria.max(target.organel.mitokondria),
+            nukleus: raider.organel.nukleus.max(target.organel.nukleus),
+            lisosom: raider.organel.lisosom.max(target.organel.lisosom),
+        };
+        raider.last_allocate_epoch = u64::MAX;
         target.status = StrainStatus::SplicedBurned;
         raider.record_mutation();
         target.record_mutation();
@@ -1241,6 +1496,8 @@ impl SnaccContract {
             target_id: distressed_target_id,
             amount: payment,
         });
+        // `EN-124` — counter demografi: hostile takeover = merger.
+        self.macro_state.total_mergers = self.macro_state.total_mergers.saturating_add(1);
         events::emit_event_json(&format!(
             r#"{{"kind":"hostile_takeover_spliced","raider_id":{},"target_id":{},"book_value":{},"payment":{},"seller_payout":{},"treasury_cut":{}}}"#,
             raider_strain_id, distressed_target_id, book_value, payment, seller_payout, treasury_cut
@@ -1288,9 +1545,9 @@ impl SnaccContract {
         let recovery = bal - bounty;
         // `10%` bounty ke akun pemanggil; `90%` ke `Rule-Bound Treasury`.
         let caller_bal = self.account_balances.get(&caller).copied().unwrap_or(0);
-        let _ = self.account_balances.insert(caller.clone(), caller_bal + bounty);
+        self.set_account_balance(&caller, caller_bal + bounty);
         self.treasury = self.treasury.saturating_add(recovery);
-        let _ = self.snacc_balances.insert(target_id, 0);
+        self.set_strain_snacc(target_id, 0);
         // Inventori molekul dibakar habis (DK-054).
         for token in constants::ALL_TOKEN_IDS {
             let _ = self.inventories.insert((target_id, token.to_string()), 0);
@@ -1298,6 +1555,13 @@ impl SnaccContract {
         v.status = StrainStatus::Liquidated;
         v.record_mutation();
         let _ = self.strains.insert(target_id, v);
+        // `EN-124` — counter demografi: harvest = lysis.
+        self.macro_state.total_lyses = self.macro_state.total_lyses.saturating_add(1);
+        // `ECON-111` — kaki K4: kas yang berpindah pada likuidasi (bounty + recovery).
+        self.macro_state.volume_epoch = self
+            .macro_state
+            .volume_epoch
+            .saturating_add(bounty + recovery);
         events::emit_event_json(&format!(
             r#"{{"kind":"strain_liquidated","target_id":{},"liquidator":"{}","bounty":{},"treasury_recovery":{}}}"#,
             target_id, caller, bounty, recovery
@@ -1327,11 +1591,12 @@ impl SnaccContract {
 // =====================================================================
 #[near]
 impl SnaccContract {
-    /// Zona makro dari suhu (kanonik: Fever `>1400`, Hypothermia `<600`, selain itu normal).
-    fn zone_at(temp_mk: u64) -> MacroZone {
-        if temp_mk > constants::FEVER_THRESHOLD_MK {
+    /// Zona makro dari suhu memakai threshold **params** (`ECON-111` final: Fever >610,
+    /// Hypothermia <600, Normal [600,610]) — selalu konsisten dengan termostat.
+    fn zone_at(&self, temp_mk: u64) -> MacroZone {
+        if temp_mk > self.macro_state.params.fever_threshold_mk {
             MacroZone::Fever
-        } else if temp_mk < constants::HYPOTHERMIA_THRESHOLD_MK {
+        } else if temp_mk < self.macro_state.params.hypothermia_threshold_mk {
             MacroZone::Hypothermia
         } else {
             MacroZone::Normal
@@ -1339,8 +1604,8 @@ impl SnaccContract {
     }
 
     /// Nama zona untuk SVG/event (kanonik string `FEVER`/`HYPO`/`NORMAL`).
-    fn zone_of(temp_mk: u64) -> &'static str {
-        Self::zone_at(temp_mk).as_str()
+    fn zone_of(&self, temp_mk: u64) -> &'static str {
+        self.zone_at(temp_mk).as_str()
     }
 
     /// `F7` / `P7` (`ADR-03`) — `nft_token(token_id)` → `NEP-171`/`NEP-177` view
@@ -1376,7 +1641,7 @@ impl SnaccContract {
             now_sec.saturating_sub(v.last_fed_sec),
             bounty,
             temp,
-            Self::zone_of(temp),
+            self.zone_of(temp),
             liquidated,
         );
         NftTokenView {
@@ -1451,11 +1716,9 @@ impl SnaccContract {
             constants::ERR_INSUFFICIENT_BALANCE
         );
         if sender_id != receiver_id {
-            let _ = self.account_balances.insert(sender_id.clone(), sender_bal - amount.0);
+            self.set_account_balance(&sender_id, sender_bal - amount.0);
             let recv = self.account_balance(&receiver_id);
-            let _ = self
-                .account_balances
-                .insert(receiver_id.clone(), recv.saturating_add(amount.0));
+            self.set_account_balance(&receiver_id, recv.saturating_add(amount.0));
         }
         events::emit_standard_event(
             "nep141",
@@ -1529,14 +1792,10 @@ impl SnaccContract {
         };
         if unused > 0 {
             let bal = self.account_balance(&sender_id);
-            let _ = self
-                .account_balances
-                .insert(sender_id.clone(), bal.saturating_add(unused));
+            self.set_account_balance(&sender_id, bal.saturating_add(unused));
             // Sisa dana ditarik kembali dari penerima (mengembalikan konservasi).
             let recv_bal = self.account_balance(&receiver_id);
-            let _ = self
-                .account_balances
-                .insert(receiver_id, recv_bal.saturating_sub(unused));
+            self.set_account_balance(&receiver_id, recv_bal.saturating_sub(unused));
         }
         U128(unused)
     }
@@ -1722,7 +1981,13 @@ impl SnaccContract {
     /// `DK-033` Fase 2 — klaim dividen pro-rata untuk `(strain_id, epoch)` yang sudah
     /// ditutup: `payout = kontribusi × epoch_dividend_rate[epoch] / DIVIDEND_RATE_SCALE`,
     /// dipotong ke saldo kolam (tidak pernah mint — `DK-010`), sekali per `(epoch, strain)`.
+    #[payable]
     pub fn claim_industrial_dividend(&mut self, strain_id: StrainId, epoch: Epoch) -> U128 {
+        // Pipeline #7 — payable defensif (refund deposit menempel; lihat feed_strain).
+        let attached = env::attached_deposit();
+        if attached > NearToken::from_near(0) {
+            let _ = Promise::new(env::predecessor_account_id()).transfer(attached);
+        }
         let caller = env::predecessor_account_id();
         let mut v = self
             .strains
@@ -1771,7 +2036,7 @@ impl SnaccContract {
             .industrial_dividend_pool
             .saturating_sub(payout);
         let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
-        let _ = self.snacc_balances.insert(strain_id, bal.saturating_add(payout));
+        self.set_strain_snacc(strain_id, bal.saturating_add(payout));
         let _ = self.dividend_claimed.insert(claim_key);
         // `ADR-29` — setiap mutasi saldo menaikkan nonce.
         v.record_mutation();
@@ -1843,7 +2108,14 @@ impl SnaccContract {
     /// - `EN-108` dormansi: saat `decayed_volume < ambang` (`DORMANCY_THRESHOLD_BPS`,
     ///   keputusan tercatat 1% supply) upkeep turun ke `UPKEEP_MIN_BPS = 50` bps.
     /// - `EN-105` volume feed masuk akumulator Great Feast + leaderboard top-3.
+    #[payable]
     pub fn feed_strain(&mut self, strain_id: StrainId, amount: U128) -> StrainVesselView {
+        // Pipeline #7 — payable defensif: deposit yang menempel dikembalikan penuh
+        // (method non-payable memicu trap wasm tanpa pesan bila operator menempel deposit).
+        let attached = env::attached_deposit();
+        if attached > NearToken::from_near(0) {
+            let _ = Promise::new(env::predecessor_account_id()).transfer(attached);
+        }
         let caller = env::predecessor_account_id();
         let mut v = self
             .strains
@@ -1897,15 +2169,26 @@ impl SnaccContract {
             constants::BPS_DENOMINATOR
         };
 
-        let effective_fee = (base_fee - discount) * rescue_bps / constants::BPS_DENOMINATOR
+        // DK-030 (triase temuan EN-104) — LANTAI FEE: kombinasi burst × dormansi ×
+        // rescue tidak boleh menghasilkan 0 (feed gratis = anti-farming lolos).
+        // Lantai = 1 yocto: selalu ada fee > 0. Formula lain tidak diubah.
+        let effective_fee = ((base_fee - discount) * rescue_bps / constants::BPS_DENOMINATOR
             * upkeep_bps
-            / constants::BPS_DENOMINATOR;
+            / constants::BPS_DENOMINATOR)
+            .max(1);
+
+        // EN-117 (suhu literal ATP) — atp_minted dihitung dari fee efektif SEBELUM
+        // termostat agar `atp_minted × ATP_VOLUME_SCALE` masuk V_epoch epoch yang sama.
+        let atp_minted = Self::calc_atp_minted(
+            effective_fee,
+            v.efficiency_bps,
+            v.organel.mitokondria,
+        );
+        let atp_volume = atp_minted.saturating_mul(constants::ATP_VOLUME_SCALE);
 
         // Debit `effective_fee` dari saldo strain -> jalur termostat `F4`.
-        let _ = self
-            .snacc_balances
-            .insert(strain_id, bal - effective_fee);
-        self.apply_thermostat_fee(strain_id, effective_fee);
+        self.set_strain_snacc(strain_id, bal - effective_fee);
+        self.apply_thermostat_fee(strain_id, effective_fee, atp_volume);
 
         // `EN-105` — akumulator Great Feast + leaderboard top-3 (`EN-107`).
         let epoch = self.macro_state.current_epoch;
@@ -1922,13 +2205,16 @@ impl SnaccContract {
         let _ = self.feast_contributions.insert((epoch, caller.clone()), contrib);
         self.feast_update_top3(epoch, &caller, contrib);
 
+        // `EN-06`/§13a — ATP dicetak dari fee efektif (dihitung di atas, masuk
+        // V_epoch via `atp_volume` — suhu literal ATP EN-117).
+        v.atp_balance = v.atp_balance.saturating_add(atp_minted);
         // Pemulihan metabolik (pola `F2`) + nonce.
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
         events::emit_event_json(&format!(
-            r#"{{"kind":"fed","strain_id":{},"base_fee":{},"effective_fee":{},"burst_bps":{},"rescue_bps":{},"dormant":{}}}"#,
-            strain_id, base_fee, effective_fee, burst_bps, rescue_bps, dormant
+            r#"{{"kind":"fed","strain_id":{},"base_fee":{},"effective_fee":{},"burst_bps":{},"rescue_bps":{},"dormant":{},"atp_minted":{}}}"#,
+            strain_id, base_fee, effective_fee, burst_bps, rescue_bps, dormant, atp_minted
         ));
         self.get_strain(strain_id)
     }
@@ -1943,7 +2229,7 @@ impl SnaccContract {
                 amount,
             }),
         }
-        top.sort_by(|a, b| b.amount.cmp(&a.amount));
+        top.sort_by_key(|f| std::cmp::Reverse(f.amount));
         top.truncate(3);
         let _ = self.epoch_top_feeders.insert(epoch, top);
     }
@@ -1958,7 +2244,7 @@ impl SnaccContract {
     pub fn get_appetite_meter(&self) -> AppetiteMeterView {
         let now_ms = env::block_timestamp() / 1_000_000;
         let temp = self.macro_state.crucible_temp_at(now_ms);
-        let zone = Self::zone_at(temp);
+        let zone = self.zone_at(temp);
         let epoch = self.macro_state.current_epoch;
         let feast_target = self.macro_state.total_snacc_supply * constants::FEAST_TARGET_BPS
             / constants::BPS_DENOMINATOR;
@@ -1975,6 +2261,7 @@ impl SnaccContract {
             dormant: self.macro_state.decayed_volume(now_ms) < dormancy_threshold,
             feast_volume: self.macro_state.epoch_feast_volume,
             feast_target,
+            risk_heat: self.get_risk_heat(),
         }
     }
 }
@@ -1997,6 +2284,8 @@ pub struct AppetiteMeterView {
     /// `EN-105` — progres Great Feast epoch berjalan.
     pub feast_volume: u128,
     pub feast_target: u128,
+    /// `EN-125` — `SpeculativeFlux` (0..10000; tingkat pertaruhan epoch berjalan).
+    pub risk_heat: u64,
 }
 
 
@@ -2011,11 +2300,864 @@ impl SnaccContract {
     /// terbaca — hanya blob state (borsh) yang diganti dengan layout baru.
     /// Tanpa ini, redeploy ke akun ber-state lama akan gagal deserialisasi
     /// (field baru di tengah/tengah layout) = seluruh view/call panic.
+    /// SEC-112 — migrate dengan PREFIX GENERASI: marker `__snacc_prefix_gen_v1`
+    /// (raw storage key di luar semua collection) dibaca → gen+1 → SEMUA collection
+    /// memakai prefix `[gen, base]` yang baru → data lama (prefix lama) tak terbaca.
+    /// `#[init(ignore_state)]` melewati deserialisasi struct lama (layout berubah aman).
+    /// Old data jadi unreachable garbage (biaya storage rent, bukan kebocoran logika).
     #[init(ignore_state)]
+    #[private]
     pub fn migrate() -> Self {
-        Self::new()
+        // SEC-113 — `#[private]`: hanya akun kontrak sendiri yang boleh memicu
+        // migrate (penelepon lain → seluruh state tak terbaca + owner reset).
+        let old_gen = env::storage_read(GEN_MARKER)
+            .and_then(|b| b.first().copied())
+            .unwrap_or(0);
+        let gen = old_gen.saturating_add(1);
+        env::storage_write(GEN_MARKER, &[gen]);
+        let mut c = Self::build(gen);
+        // SEC-113 — owner lama dipertahankan lewat marker raw-storage; fallback:
+        // pemanggil private (= akun kontrak sendiri).
+        let owner = env::storage_read(OWNER_MARKER)
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse::<AccountId>().ok())
+            .unwrap_or_else(env::predecessor_account_id);
+        c.owner_id = Some(owner.clone());
+        env::storage_write(OWNER_MARKER, owner.as_bytes());
+        c.spawn_npcs();
+        c
     }
 }
+
+// =====================================================================
+// Pipeline #3 — EN-121/122/123 (koloni, sitokinesis, adopsi) + EN-125 + NPC ADR-30
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Hitung jumlah strain AKTIF milik akun (koloni; `Liquidated`/`SplicedBurned`
+    /// tidak dihitung — pagar `MAX_COLONY_SIZE` untuk sel hidup).
+    fn colony_active_count(&self, owner: &AccountId) -> u64 {
+        self.strains_by_owner
+            .get(owner)
+            .map(|v| {
+                v.iter()
+                    .filter(|id| {
+                        self.strains
+                            .get(id)
+                            .map(|s| {
+                                !matches!(
+                                    s.status,
+                                    StrainStatus::Liquidated | StrainStatus::SplicedBurned
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
+    /// `EN-121` — koloni satu akun (sel hidup, ≤ `MAX_COLONY_SIZE` by construction).
+    /// TODO(sesi-utama): Σ ATP koloni = Σ `atp_balance` (field EN-114) — view
+    /// `get_colony_atp(owner_id)` ditambahkan setelah field ATP ter-merge (EN-121:
+    /// "anggaran $ATP bersama koloni").
+    pub fn get_colony(&self, owner_id: AccountId) -> Vec<StrainVesselView> {
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let mut out = Vec::new();
+        if let Some(owned) = self.strains_by_owner.get(&owner_id) {
+            for id in owned.iter() {
+                if let Some(v) = self.strains.get(id) {
+                    if !matches!(
+                        v.status,
+                        StrainStatus::Liquidated | StrainStatus::SplicedBurned
+                    ) {
+                        out.push(v.to_view(now_sec));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `EN-121` — Σ ATP koloni aktif satu akun (anggaran `$ATP` bersama, LC-20).
+    pub fn get_colony_atp(&self, owner_id: AccountId) -> U128 {
+        let mut total: u128 = 0;
+        if let Some(owned) = self.strains_by_owner.get(&owner_id) {
+            for id in owned.iter() {
+                if let Some(v) = self.strains.get(id) {
+                    if !matches!(
+                        v.status,
+                        StrainStatus::Liquidated | StrainStatus::SplicedBurned
+                    ) {
+                        total = total.saturating_add(v.atp_balance);
+                    }
+                }
+            }
+        }
+        U128(total)
+    }
+
+    /// `EN-122` — `divide_strain`: sitokinesis (§13a). Saldo, vitality, dan spora
+    /// `mt:spore-ignis` anak = separuh (induk dipotong — Σ induk+anak = saldo induk);
+    /// organel ÷2 (anak floor, induk sisa — total terjaga); `generation` anak = induk+1;
+    /// biaya ATP 3; pagar `MAX_COLONY_SIZE=5` / `MAX_GENERATION=8`.
+    pub fn divide_strain(&mut self, strain_id: StrainId) -> (StrainVesselView, StrainVesselView) {
+        let caller = env::predecessor_account_id();
+        let mut parent = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, parent.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert!(
+            !matches!(
+                parent.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        // Pagar koloni/generasi (`EN-124`/§13a).
+        assert!(
+            self.colony_active_count(&caller) < u64::from(constants::MAX_COLONY_SIZE),
+            "{}",
+            constants::ERR_COLONY_FULL
+        );
+        let child_gen = parent.generation.saturating_add(1);
+        assert!(
+            child_gen <= constants::MAX_GENERATION,
+            "{}",
+            constants::ERR_MAX_GENERATION
+        );
+        // Induk hidup (anakan tidak lahir dari sel mati).
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let _ = Self::assert_not_starving(&parent, now_sec);
+        // `EN-116`/§13a — biaya ATP sitokinesis = 3.
+        Self::pay_atp(&mut parent, 3);
+        // `EN-124` — invariant demografi protektif: pembelahan (reproduksi gratis)
+        // wajib punya "anggaran" dari merger + lisis. Interpretasi tercatat: bentuk
+        // literal `births ≤ merges + lyses` membuat inkubasi pertama mustahil
+        // (births=1, merges+lyses=0), maka gate diterapkan pada divides:
+        // `total_divides ≤ total_merges + total_lyses` (inkubasi berbayar bebas —
+        // modal nyata masuk, `V-04` aman). Dilaporkan di laporan pipeline #5.
+        self.macro_state.total_divides = self.macro_state.total_divides.saturating_add(1);
+        // births = inkubasi + divide (§13a/brief).
+        self.macro_state.total_births = self.macro_state.total_births.saturating_add(1);
+        assert!(
+            self.macro_state.total_divides
+                <= self.macro_state.total_mergers + self.macro_state.total_lyses,
+            "{}",
+            constants::ERR_BIRTHS_EXCEEDED
+        );
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_spent","strain_id":{},"purpose":"divide","cost":3}}"#, strain_id
+        ));
+
+        // Pembagian kas: anak = floor(bal/2), induk = sisa (Σ = saldo induk, `I-01`).
+        let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        let child_bal = bal / 2;
+        self.set_strain_snacc(strain_id, bal - child_bal);
+        // Pembagian vitality: anak separuh, induk dipotong.
+        let child_vitality = parent.vitality / 2;
+        parent.vitality -= child_vitality;
+        // Pembagian spora `mt:spore-ignis`: anak = floor(n/2), induk = sisa.
+        let ignis = self.inv_balance(strain_id, constants::GENESIS_SPORE_TOKEN_ID);
+        let child_spores = ignis / 2;
+        let _ = self
+            .inventories
+            .insert((strain_id, constants::GENESIS_SPORE_TOKEN_ID.to_string()), ignis - child_spores);
+
+        // Organel ÷2 (anak floor per slot, induk sisa — total terjaga).
+        let child_organel = OrganelleSlots {
+            mitokondria: parent.organel.mitokondria / 2,
+            nukleus: parent.organel.nukleus / 2,
+            lisosom: parent.organel.lisosom / 2,
+        };
+        parent.organel = OrganelleSlots {
+            mitokondria: parent.organel.mitokondria - child_organel.mitokondria,
+            nukleus: parent.organel.nukleus - child_organel.nukleus,
+            lisosom: parent.organel.lisosom - child_organel.lisosom,
+        };
+
+        // Anakan: genom (role_mask, efficiency, phenotype) & bmr diwariskan; gen = induk+1.
+        let child_id = self.next_strain_id;
+        self.next_strain_id += 1;
+        self.set_strain_snacc(child_id, child_bal);
+        if child_spores > 0 {
+            self.inv_mint(child_id, constants::GENESIS_SPORE_TOKEN_ID, child_spores);
+        }
+        let child = StrainVessel {
+            strain_id: child_id,
+            owner_id: caller.clone(),
+            vault_subaccount: format!("s-{}.{}", child_id, env::current_account_id())
+                .parse()
+                .unwrap(),
+            vitality: child_vitality,
+            efficiency_bps: parent.efficiency_bps,
+            bmr_per_hour: parent.bmr_per_hour,
+            last_fed_sec: now_sec,
+            role_mask: parent.role_mask,
+            state_nonce: 0,
+            pending_callbacks: 0,
+            // §13a — ATP anak = `INITIAL_ATP` (50, energi kelahiran).
+            atp_balance: constants::INITIAL_ATP,
+            pending_commitment: None,
+            phenotype_trait: parent.phenotype_trait.clone(),
+            generation: child_gen,
+            organel: child_organel,
+            last_allocate_epoch: u64::MAX,
+            status: StrainStatus::Active,
+        };
+        let _ = self.strains.insert(child_id, child.clone());
+        parent.record_mutation();
+        let _ = self.strains.insert(strain_id, parent.clone());
+        // Indeks koloni: anak masuk daftar pemilik.
+        match self.strains_by_owner.get_mut(&caller) {
+            Some(owned) => owned.push(child_id),
+            None => {
+                let mut owned = near_sdk::store::Vector::new(
+                    format!("o:{}:{}", self.prefix_gen, caller).into_bytes(),
+                );
+                owned.push(child_id);
+                let _ = self.strains_by_owner.insert(caller.clone(), owned);
+            }
+        }
+        // `D8` log + event.
+        self.mna_logs.push(MnaLogEntry {
+            timestamp_ms: env::block_timestamp() / 1_000_000,
+            kind: state::MnaKind::Divide,
+            actor_id: caller,
+            target_id: child_id,
+            amount: child_bal,
+        });
+        events::emit_event_json(&format!(
+            r#"{{"kind":"strain_divided","parent_id":{},"child_id":{},"child_generation":{},"parent_balance":{},"child_balance":{},"child_vitality":{},"child_spores":{}}}"#,
+            strain_id, child_id, child_gen, bal - child_bal, child_bal, child_vitality, child_spores
+        ));
+        (parent.to_view(now_sec), child.to_view(now_sec))
+    }
+
+    /// `EN-123` — `adopt`: ambil alih Strain Distressed (`1 <= eff <= 2000`) dengan
+    /// `book_value` **TANPA premium 15%** → 100% ke pemilik lama; ownership pindah
+    /// ke pemilik raider (mencegah lisis — kompetisi dengan `hostile_takeover_splice`).
+    pub fn adopt(
+        &mut self,
+        target_id: StrainId,
+        raider_strain_id: StrainId,
+        expected_target_nonce: u64,
+    ) -> StrainVesselView {
+        assert_ne!(target_id, raider_strain_id, "{}", constants::ERR_SAME_STRAIN);
+        let caller = env::predecessor_account_id();
+        let raider = self
+            .strains
+            .get(&raider_strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, raider.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        let mut target = self
+            .strains
+            .get(&target_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert!(
+            !matches!(
+                target.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_ALREADY_LIQUIDATED
+        );
+        // `SEC-110`/`I-14` — anti seller-drain: nonce target wajib cocok (pola hostile).
+        target.assert_atomic_ready(expected_target_nonce);
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let eff = target.effective_vitality(now_sec);
+        // Jendela Distressed (Tier 2); eff 0 = Tier 3 → jalur F6 (lisis), bukan adopt.
+        assert!((1..=2000).contains(&eff), "{}", constants::ERR_NOT_DISTRESSED);
+        // Koloni pengadopsi wajib punya ruang (sel hidup pindah koloni).
+        assert!(
+            self.colony_active_count(&caller) < u64::from(constants::MAX_COLONY_SIZE),
+            "{}",
+            constants::ERR_COLONY_FULL
+        );
+        // Book value (saldo + Σ inventori × floor_price 1) TANPA premium → 100% ke pemilik lama.
+        let target_bal = self.snacc_balances.get(&target_id).copied().unwrap_or(0);
+        let mut book_value = target_bal;
+        for token in constants::ALL_TOKEN_IDS {
+            book_value = book_value.saturating_add(
+                self.inv_balance(target_id, token) * constants::MOLECULE_FLOOR_PRICE,
+            );
+        }
+        let payer_bal = self.snacc_balances.get(&raider_strain_id).copied().unwrap_or(0);
+        assert!(
+            payer_bal >= book_value,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+        let old_owner = target.owner_id.clone();
+        self.set_strain_snacc(raider_strain_id, payer_bal - book_value);
+        let seller = self.account_balances.get(&old_owner).copied().unwrap_or(0);
+        self.set_account_balance(&old_owner, seller.saturating_add(book_value));
+
+        // Ownership pindah: perbarui indeks `strains_by_owner` (keluar dari koloni lama).
+        if let Some(owned) = self.strains_by_owner.get_mut(&old_owner) {
+            if let Some(idx) = owned.iter().position(|id| *id == target_id) {
+                owned.swap_remove(idx as u32);
+            }
+        }
+        match self.strains_by_owner.get_mut(&caller) {
+            Some(owned) => owned.push(target_id),
+            None => {
+                let mut owned =
+                    near_sdk::store::Vector::new(format!("o:{}:{}", self.prefix_gen, caller).into_bytes());
+                owned.push(target_id);
+                let _ = self.strains_by_owner.insert(caller.clone(), owned);
+            }
+        }
+        target.owner_id = caller;
+        target.record_mutation();
+        let _ = self.strains.insert(target_id, target.clone());
+        // `D8` log + event.
+        let adopter = raider.owner_id.clone();
+        self.mna_logs.push(MnaLogEntry {
+            timestamp_ms: env::block_timestamp() / 1_000_000,
+            kind: state::MnaKind::Adopt,
+            actor_id: adopter.clone(),
+            target_id,
+            amount: book_value,
+        });
+        events::emit_event_json(&format!(
+            r#"{{"kind":"strain_adopted","target_id":{},"adopter":"{}","raider_strain_id":{},"book_value":{}}}"#,
+            target_id, adopter, raider_strain_id, book_value
+        ));
+        target.to_view(now_sec)
+    }
+
+    /// `LC-20` — `conjugate_traits`: konjugasi plasmid — **salin** `phenotype_trait`
+    /// dari strain sumber ke strain target TANPA merger (sumber tetap memilikinya).
+    /// Syarat (keputusan tercatat): pemilik sama (`ERR_NOT_SAME_OWNER`), kedua sel
+    /// hidup, parameter `phenotype_trait` wajib cocok dengan trait sumber saat ini
+    /// (mencegah kejutan TOCTOU — `ERR_TRAIT_MISMATCH`); biaya ATP target = 2
+    /// (keputusan: §13a tidak mendaftarkan konjugasi, mengikuti biaya transmute).
+    pub fn conjugate_traits(
+        &mut self,
+        from_strain_id: StrainId,
+        to_strain_id: StrainId,
+        phenotype_trait: String,
+    ) -> StrainVesselView {
+        assert_ne!(
+            from_strain_id, to_strain_id,
+            "{}",
+            constants::ERR_SAME_STRAIN
+        );
+        let caller = env::predecessor_account_id();
+        let mut from = self
+            .strains
+            .get(&from_strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let mut to = self
+            .strains
+            .get(&to_strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, from.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert_eq!(caller, to.owner_id, "{}", constants::ERR_NOT_SAME_OWNER);
+        assert!(
+            !matches!(
+                from.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        assert!(
+            !matches!(
+                to.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        assert_eq!(
+            from.phenotype_trait.as_deref(),
+            Some(phenotype_trait.as_str()),
+            "{}",
+            constants::ERR_TRAIT_MISMATCH
+        );
+        // Biaya ATP konjugasi = 2, dibayar strain target (keputusan tercatat).
+        Self::pay_atp(&mut to, 2);
+        to.phenotype_trait = from.phenotype_trait.clone();
+        to.record_mutation();
+        from.record_mutation();
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let _ = self.strains.insert(from_strain_id, from);
+        let _ = self.strains.insert(to_strain_id, to.clone());
+        events::emit_event_json(&format!(
+            r#"{{"kind":"trait_conjugated","from_strain_id":{},"to_strain_id":{},"phenotype_trait":"{}"}}"#,
+            from_strain_id, to_strain_id, phenotype_trait
+        ));
+        to.to_view(now_sec)
+    }
+
+    /// `EN-125` — `SpeculativeFlux` surfaced: indikator "tingkat pertaruhan" per epoch
+    /// (skala 0..10000). Definisi (keputusan tercatat — tidak ternominalisasi di vault):
+    /// dasar = proksimitas Fever (`temp × 10000 / 1400`), +1000 saat Nutrient Burst
+    /// aktif (momen taruhan EN-01), +1000 saat kolam dividen ≥ 1% supply (momen klaim
+    /// DK-033). Cap 10000.
+    pub fn get_risk_heat(&self) -> u64 {
+        let now_ms = env::block_timestamp() / 1_000_000;
+        let temp = self.macro_state.crucible_temp_at(now_ms);
+        let mut heat = temp.saturating_mul(10_000)
+            / self.macro_state.params.fever_threshold_mk;
+        if self.macro_state.active_burst_bps(self.macro_state.current_epoch) > 0 {
+            heat += 1_000;
+        }
+        if self.macro_state.industrial_dividend_pool * 100
+            >= self.macro_state.total_snacc_supply
+        {
+            heat += 1_000;
+        }
+        heat.min(10_000)
+    }
+
+    /// `ADR-30` — view satu NPC.
+    pub fn get_npc(&self, npc_id: String) -> NpcMerchantAgent {
+        self.npc_agents
+            .get(&npc_id)
+            .cloned()
+            .expect(constants::ERR_NPC_UNKNOWN)
+    }
+
+    /// Kuotasi harga spora NPC (murni, dipakai quote & buy):
+    /// `unit = max(1, floor(P_base × S_target / max(S_after, 1)))` (`I-15` — harga
+    /// menaik saat stok NPC menyusut di bawah target; equality memenuhi "≥ floor").
+    fn npc_quote_internal(&self, npc: &NpcMerchantAgent, buy_amount: u64) -> NpcQuoteView {
+        let s_after = npc.spores_stock.saturating_sub(buy_amount);
+        let unit_price = std::cmp::max(
+            1,
+            npc.base_spore_price * u128::from(npc.target_spores_stock)
+                / std::cmp::max(u128::from(s_after), 1),
+        );
+        let total_cost = unit_price * u128::from(buy_amount);
+        NpcQuoteView {
+            npc_id: npc.npc_id.clone(),
+            unit_price_vita: unit_price,
+            total_cost_snacc: total_cost,
+            npc_spores_stock_after: s_after,
+            crucible_temp_mk: self.get_crucible_temp(),
+            reasoning_tooltip: format!(
+                "I hold {} Spore-Ignis (target {}). Selling {} drops my stock to {} — unit price rises to {} (P_base {}). Scarcity is my leverage.",
+                npc.spores_stock,
+                npc.target_spores_stock,
+                buy_amount,
+                s_after,
+                unit_price,
+                npc.base_spore_price
+            ),
+        }
+    }
+
+    /// `ADR-30` — kuotasi beli spora dari NPC (view; `now_sec` dari spec §5.1 tidak
+    /// dijadikan parameter — `V-02`, konsisten dengan keputusan `hostile_takeover_splice`).
+    pub fn npc_quote_spores(&self, npc_id: String, buy_amount: u64) -> NpcQuoteView {
+        assert!(buy_amount > 0, "{}", constants::ERR_BAD_AMOUNT);
+        let npc = self
+            .npc_agents
+            .get(&npc_id)
+            .cloned()
+            .expect(constants::ERR_NPC_UNKNOWN);
+        self.npc_quote_internal(&npc, buy_amount)
+    }
+
+    /// `ADR-30` / `I-15` — beli atomik spora `mt:spore-ignis` dari NPC dengan kas
+    /// saldo strain. Konservasi persis: `Δnpc.snacc_reserve == −Δstrain.balance ==
+    /// total_cost` dan `Δnpc.spores_stock == −Δstrain inventory == buy_amount`.
+    pub fn npc_buy_spores(
+        &mut self,
+        strain_id: StrainId,
+        npc_id: String,
+        buy_amount: u64,
+    ) -> NpcQuoteView {
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert!(buy_amount > 0, "{}", constants::ERR_BAD_AMOUNT);
+        let mut npc = self
+            .npc_agents
+            .get(&npc_id)
+            .cloned()
+            .expect(constants::ERR_NPC_UNKNOWN);
+        assert!(
+            npc.spores_stock >= buy_amount,
+            "{}",
+            constants::ERR_NPC_OUT_OF_STOCK
+        );
+        let quote = self.npc_quote_internal(&npc, buy_amount);
+        let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        assert!(
+            bal >= quote.total_cost_snacc,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+        // Konservasi `I-15` — dua sisi sama persis (+ agregat `sum_npc_reserve`).
+        self.set_strain_snacc(strain_id, bal - quote.total_cost_snacc);
+        npc.snacc_reserve = npc.snacc_reserve.saturating_add(quote.total_cost_snacc);
+        self.macro_state.sum_npc_reserve = self
+            .macro_state
+            .sum_npc_reserve
+            .saturating_add(quote.total_cost_snacc);
+        npc.spores_stock -= buy_amount;
+        npc.trades_executed = npc.trades_executed.saturating_add(1);
+        let _ = self.npc_agents.insert(npc_id.clone(), npc);
+        self.inv_mint(strain_id, constants::GENESIS_SPORE_TOKEN_ID, u128::from(buy_amount));
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"npc_spores_bought","strain_id":{},"npc_id":"{}","amount":{},"unit_price":{},"total_cost":{}}}"#,
+            strain_id, npc_id, buy_amount, quote.unit_price_vita, quote.total_cost_snacc
+        ));
+        quote
+    }
+}
+
+// =====================================================================
+// Pipeline #4 — EN-114..119: metabolisme ATP/mitokondria + kalibrasi ECON-111
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `EN-118`/§13a — `allocate_atp`: alokasi ATP ke slot organel.
+    /// 1× per epoch (`ERR_ALREADY_ALLOCATED`); level ≤ `MAX_ORGANEL_LEVEL = 5`
+    /// (`ERR_ORGANEL_LEVEL_MAX`); bayar 1 ATP per KENAIKAN level; set organel,
+    /// `last_allocate_epoch = epoch`, `record_mutation`, emit `atp_allocated`.
+    pub fn allocate_atp(
+        &mut self,
+        strain_id: StrainId,
+        mitokondria: u8,
+        nukleus: u8,
+        lisosom: u8,
+    ) -> StrainVesselView {
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert!(
+            !matches!(
+                v.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        assert!(
+            mitokondria <= constants::MAX_ORGANEL_LEVEL
+                && nukleus <= constants::MAX_ORGANEL_LEVEL
+                && lisosom <= constants::MAX_ORGANEL_LEVEL,
+            "{}",
+            constants::ERR_ORGANEL_LEVEL_MAX
+        );
+        let epoch = self.macro_state.current_epoch;
+        assert!(
+            v.last_allocate_epoch != epoch,
+            "{}",
+            constants::ERR_ALREADY_ALLOCATED
+        );
+        // Biaya: 1 ATP per kenaikan level per slot (§13a "allocate 1/level").
+        let cost = u128::from(mitokondria.saturating_sub(v.organel.mitokondria))
+            + u128::from(nukleus.saturating_sub(v.organel.nukleus))
+            + u128::from(lisosom.saturating_sub(v.organel.lisosom));
+        Self::pay_atp(&mut v, cost);
+        v.organel = OrganelleSlots { mitokondria, nukleus, lisosom };
+        v.last_allocate_epoch = epoch;
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"atp_allocated","strain_id":{},"mitokondria":{},"nukleus":{},"lisosom":{},"cost":{},"epoch":{}}}"#,
+            strain_id, mitokondria, nukleus, lisosom, cost, epoch
+        ));
+        self.get_strain(strain_id)
+    }
+}
+
+// =====================================================================
+// Pipeline #5 — LC-16: transplantasi sel utuh (`NEP-171` nft_transfer)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Pindah entri indeks koloni: keluar dari daftar `from`, masuk daftar `to`.
+    fn move_strain_owner_index(
+        &mut self,
+        strain_id: StrainId,
+        from: &AccountId,
+        to: &AccountId,
+    ) {
+        if let Some(owned) = self.strains_by_owner.get_mut(from) {
+            if let Some(idx) = owned.iter().position(|id| *id == strain_id) {
+                owned.swap_remove(idx as u32);
+            }
+        }
+        match self.strains_by_owner.get_mut(to) {
+            Some(owned) => owned.push(strain_id),
+            None => {
+                let mut owned =
+                    near_sdk::store::Vector::new(format!("o:{}:{}", self.prefix_gen, to).into_bytes());
+                owned.push(strain_id);
+                let _ = self.strains_by_owner.insert(to.clone(), owned);
+            }
+        }
+    }
+
+    /// `LC-16` — `nft_transfer` standar `NEP-171`: transplantasi sel utuh — saldo
+    /// `$SNACC` (perut), spora/inventori, organel, ATP, dan `state_nonce` mengikuti
+    /// vessel (semua state ber-key `strain_id`). Wajib tepat 1 yoctoNEAR.
+    /// `approval_id` diterima demi bentuk ABI NEP-171; registri approval `NEP-178`
+    /// tidak diimplementasi (keputusan tercatat — parameter diabaikan).
+    /// Sel mati (`Liquidated`/`SplicedBurned`) tidak dapat dipindah.
+    #[payable]
+    pub fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: String,
+        approval_id: Option<String>,
+        memo: Option<String>,
+    ) {
+        // NEP-178 (approval management) belum diimplementasi — parameter diterima
+        // demi bentuk ABI NEP-171 dan diabaikan (keputusan tercatat).
+        let _ = approval_id;
+        Self::assert_one_yocto();
+        assert_ne!(
+            receiver_id,
+            env::predecessor_account_id(),
+            "{}",
+            constants::ERR_SAME_STRAIN
+        );
+        let strain_id: StrainId = token_id
+            .parse()
+            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        let old_owner = v.owner_id.clone();
+        assert_eq!(
+            env::predecessor_account_id(),
+            old_owner,
+            "{}",
+            constants::ERR_NOT_OWNED_BY_CALLEE
+        );
+        assert!(
+            !matches!(
+                v.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
+            ),
+            "{}",
+            constants::ERR_ALREADY_LIQUIDATED
+        );
+        v.owner_id = receiver_id.clone();
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        self.move_strain_owner_index(strain_id, &old_owner, &receiver_id);
+        // Event `NEP-297` standard `nep171` — bentuk persis standar NEP-171.
+        events::emit_standard_event(
+            "nep171",
+            "nft_transfer",
+            &format!(
+                r#"{{"old_owner_id":"{}","new_owner_id":"{}","token_ids":["{}"],"approved_account_ids":null,"memo":{}}}"#,
+                old_owner,
+                receiver_id,
+                token_id,
+                match memo {
+                    Some(m) => format!(r#""{}""#, m),
+                    None => "null".to_string(),
+                }
+            ),
+        );
+    }
+
+    /// `LC-16` — `nft_transfer_call` standar NEP-171: transfer + promise
+    /// `receiver.nft_on_transfer` + callback `#[private] nft_resolve_transfer`
+    /// yang mengembalikan token bila kontrak penerima menolak / gagal.
+    #[payable]
+    pub fn nft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: String,
+        msg: String,
+        approval_id: Option<String>,
+        memo: Option<String>,
+    ) -> Promise {
+        self.nft_transfer(receiver_id.clone(), token_id.clone(), approval_id, memo);
+        // SEC-111 (triase Opsi a) — kunci `pending_callbacks` selama promise window;
+        // dilepas di `nft_resolve_transfer` (semua jalur).
+        let strain_id: StrainId = token_id
+            .parse()
+            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        if let Some(mut v) = self.strains.get(&strain_id).cloned() {
+            v.pending_callbacks = 1;
+            v.record_mutation();
+            let _ = self.strains.insert(strain_id, v);
+        }
+        let sender_id = env::predecessor_account_id();
+        let args = near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+            "sender_id": sender_id,
+            "previous_owner_id": sender_id,
+            "token_id": token_id,
+            "msg": msg,
+        }))
+        .unwrap();
+        Promise::new(receiver_id.clone())
+            .function_call(
+                "nft_on_transfer".to_string(),
+                args,
+                NearToken::from_near(0),
+                near_sdk::Gas::from_tgas(20),
+            )
+            .then(Self::ext(env::current_account_id()).nft_resolve_transfer(
+                sender_id,
+                receiver_id,
+                token_id,
+            ))
+    }
+
+    /// `ADR-24` — resolusi `nft_transfer_call` (anti-spoofing): kontrak penerima
+    /// mengembalikan `bool` (`true` = ditolak); promise gagal = dianggap ditolak;
+    /// token kembali ke pemilik sebelumnya (indeks koloni ikut).
+    #[private]
+    pub fn nft_resolve_transfer(
+        &mut self,
+        previous_owner_id: AccountId,
+        receiver_id: AccountId,
+        token_id: String,
+    ) {
+        // SEC-111 — lepas kunci `pending_callbacks` di SEMUA jalur (diterima/ditolak).
+        let strain_id_lock: StrainId = token_id
+            .parse()
+            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        if let Some(mut v) = self.strains.get(&strain_id_lock).cloned() {
+            v.pending_callbacks = 0;
+            v.record_mutation();
+            let _ = self.strains.insert(strain_id_lock, v);
+        }
+        let rejected = match env::promise_result_checked(0, usize::MAX) {
+            Ok(bytes) => near_sdk::serde_json::from_slice::<bool>(&bytes).unwrap_or(true),
+            Err(_) => true,
+        };
+        if !rejected {
+            return;
+        }
+        let strain_id: StrainId = token_id
+            .parse()
+            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        if let Some(mut v) = self.strains.get(&strain_id).cloned() {
+            let current_owner = v.owner_id.clone();
+            v.owner_id = previous_owner_id.clone();
+            v.record_mutation();
+            let _ = self.strains.insert(strain_id, v);
+            self.move_strain_owner_index(strain_id, &current_owner, &previous_owner_id);
+            events::emit_standard_event(
+                "nep171",
+                "nft_transfer",
+                &format!(
+                    r#"{{"old_owner_id":"{}","new_owner_id":"{}","token_ids":["{}"],"approved_account_ids":null,"memo":"nft_transfer_call rejected"}}"#,
+                    receiver_id, previous_owner_id, token_id
+                ),
+            );
+        }
+    }
+}
+
+// =====================================================================
+// Pipeline #6 — view yang hilang (temuan audit KPI J3.8/J3.9):
+// `get_inventory` (NEP-245) & `get_global_solvency` (invarian `V-04`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// J3.8 — saldo satu molekul `NEP-245` pada strain. `0` bila tidak ada —
+    /// TIDAK panic (strain/token tak dikenal = saldo nol, keputusan tercatat).
+    pub fn get_inventory(&self, strain_id: StrainId, token_id: String) -> U128 {
+        U128(self.inv_balance(strain_id, &token_id))
+    }
+
+    /// J3.9 — invarian `V-04` versi lengkap (termasuk ledger akun & NPC).
+    /// Rumus persis (keputusan tercatat; seluruhnya integer — toleransi = 0):
+    ///   pemasukan = `total_minted (= supply + burned) + total_catalyst_fees`
+    ///   pengeluaran = `total_burned + treasury + industrial_dividend_pool
+    ///                + epoch_dividend_inflow + Σsaldo strain + Σsaldo akun + Σnpc_reserve`
+    /// `drift = pemasukan − pengeluaran`; `solvent = (drift == 0)`.
+    /// `drift ≠ 0` = bug pembukuan (dilaporkan jujur, bukan disembunyikan).
+    /// Eksklusi (ledger terpisah, bukan `$SNACC`): deposit storage NEP-141,
+    /// deposit `materialize_subaccount` (NEAR nyata ke sub-akun).
+    pub fn get_global_solvency(&self) -> GlobalSolvencyView {
+        let total_minted = self
+            .macro_state
+            .total_snacc_supply
+            .saturating_add(self.macro_state.total_snacc_burned);
+        let total_out = self
+            .macro_state
+            .total_snacc_burned
+            .saturating_add(self.treasury)
+            .saturating_add(self.macro_state.industrial_dividend_pool)
+            .saturating_add(self.macro_state.epoch_dividend_inflow)
+            .saturating_add(self.macro_state.sum_strain_snacc)
+            .saturating_add(self.macro_state.sum_account_balances)
+            .saturating_add(self.macro_state.sum_npc_reserve);
+        let total_in = total_minted.saturating_add(self.macro_state.total_catalyst_fees);
+        let drift = total_in as i128 - total_out as i128;
+        GlobalSolvencyView {
+            total_minted,
+            total_burned: self.macro_state.total_snacc_burned,
+            sum_account_balances: self.macro_state.sum_account_balances,
+            sum_strain_snacc: self.macro_state.sum_strain_snacc,
+            sum_treasury: self.treasury,
+            sum_dividend_pool: self.macro_state.industrial_dividend_pool,
+            epoch_dividend_inflow: self.macro_state.epoch_dividend_inflow,
+            sum_npc_reserve: self.macro_state.sum_npc_reserve,
+            total_catalyst_fees: self.macro_state.total_catalyst_fees,
+            drift,
+            solvent: drift == 0,
+        }
+    }
+}
+
+/// J3.9 — tampilan invarian `V-04` (semua komponen + drift bertanda).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalSolvencyView {
+    pub total_minted: u128,
+    pub total_burned: u128,
+    pub sum_account_balances: u128,
+    pub sum_strain_snacc: u128,
+    pub sum_treasury: u128,
+    pub sum_dividend_pool: u128,
+    pub epoch_dividend_inflow: u128,
+    pub sum_npc_reserve: u128,
+    pub total_catalyst_fees: u128,
+    /// `pemasukan − pengeluaran`; `0` = solvent.
+    pub drift: i128,
+    pub solvent: bool,
+}
+
+#[cfg(test)]
+mod qa_en117_tests;
+
+#[cfg(test)]
+mod qa_organel_tests;
+
+#[cfg(test)]
+mod qa_en104_tests;
+
+#[cfg(test)]
+mod qa_ma_tests;
+
+#[cfg(test)]
+mod qa_dk026_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2032,10 +3174,58 @@ mod tests {
     fn set_context_at(predecessor: &str, deposit: NearToken, block_timestamp: u64) {
         let mut builder = VMContextBuilder::new();
         builder
+            .current_account_id("snacc-v001.testnet".parse().unwrap())
             .predecessor_account_id(predecessor.parse().unwrap())
             .attached_deposit(deposit)
             .block_timestamp(block_timestamp);
         testing_env!(builder.build());
+    }
+
+    /// Pipeline #7 — suffix sub-akun diturunkan dari akun kontrak (regresi bug
+    /// `VAULT_SUBACCOUNT_SUFFIX` hardcode `.snacc-v001.near` yang gagal di testnet).
+    #[test]
+    fn pipeline7_suffix_mengikuti_akun_kontrak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert_eq!(
+            c.get_strain(1).vault_subaccount.to_string(),
+            "s-1.snacc-v001.testnet"
+        );
+        // Kontrak dengan akun lain -> suffix mengikuti (parent selalu ada).
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("snacc-lab.testnet".parse().unwrap())
+            .predecessor_account_id(ALKEMIS_ID.parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(10_000))
+            .block_timestamp(3_600_000_000_000);
+        testing_env!(b.build());
+        let v = c.incubate_strain(state::StrainRole::Extractor, U128(10_000), 0);
+        assert_eq!(v.vault_subaccount.to_string(), "s-2.snacc-lab.testnet");
+    }
+
+    /// Pipeline #7 — `feed_strain` kini payable: deposit menempel TIDAK memicu trap;
+    /// dipanggil dengan deposit -> sukses (refund via promise).
+    #[test]
+    fn pipeline7_feed_payable_dengan_deposit() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1_000_000)); // deposit menempel
+        let v = c.feed_strain(1, U128(1_000)); // dulu: trap non-payable
+        assert_eq!(v.efficiency_bps, 10000);
+    }
+
+    /// Pipeline #7 — `claim_industrial_dividend` kini payable (regresi yang sama).
+    #[test]
+    fn pipeline7_claim_payable_dengan_deposit() {
+        let mut c = dk_setup();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(500_000)); // deposit menempel
+        c.synthesize_and_redeem_aether(2, U128(1));
+        c.advance_epoch();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1_000_000)); // deposit menempel
+        let payout = c.claim_industrial_dividend(2, 0); // dulu: trap non-payable
+        assert!(payout.0 > 0);
     }
 
     #[test]
@@ -2133,9 +3323,10 @@ mod tests {
     fn vc003_subaccount_format() {
         let mut c = SnaccContract::new();
         let v1 = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
-        assert_eq!(v1.vault_subaccount.to_string(), "s-1.snacc-v001.near");
+        // Pipeline #7: suffix = akun kontrak (`.testnet` di testnet).
+        assert_eq!(v1.vault_subaccount.to_string(), "s-1.snacc-v001.testnet");
         let v2 = call_incubate(&mut c, 1_000_000_000_000u128, FERMENTER_ROLE, 0);
-        assert_eq!(v2.vault_subaccount.to_string(), "s-2.snacc-v001.near");
+        assert_eq!(v2.vault_subaccount.to_string(), "s-2.snacc-v001.testnet");
     }
 
     /// (e) spora termint ke inventori NEP-245 (strain_id, token_id).
@@ -2163,13 +3354,13 @@ mod tests {
         let view = c.get_strain(1);
         assert_eq!(view.strain_id, 1);
         assert_eq!(view.owner_id.to_string(), ALKEMIS_ID);
-        assert_eq!(view.vault_subaccount.to_string(), "s-1.snacc-v001.near");
+        assert_eq!(view.vault_subaccount.to_string(), "s-1.snacc-v001.testnet");
         assert_eq!(view.vitality, 8500);
         assert_eq!(view.efficiency_bps, 10000);
         assert_eq!(view.bmr_per_hour, 100);
         assert_eq!(view.state_nonce, 0);
         assert_eq!(view.pending_callbacks, 0);
-        assert_eq!(view.atp_balance, 0);
+        assert_eq!(view.atp_balance, 50); // `INITIAL_ATP` (§13a)
         assert_eq!(view.generation, 0);
         assert_eq!(view.status, state::StrainStatus::Active);
         assert_eq!(view.role_mask, state::constants::ROLE_EXTRACTOR);
@@ -2434,20 +3625,22 @@ mod tests {
         let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
         assert_eq!(c.macro_state.total_snacc_supply, 10_000);
 
-        // Titik waktu 1: t1 = 3600s (3_600_000_000_000 ns), fee = 10_000 -> volume_epoch = 10_000
-        // temp(t1) = floor(1000 * 10_000 / 10_000) = 1000 mK (zona netral, supply tetap 10_000)
+        // Titik waktu 1: t1 = 3600s, fee = 10_000 + kaki K3 (1 spora × 5 × 100 = 500)
+        // -> volume_epoch = 10_500; temp = floor(1000×10_500/10_000) = 1050 > 610 (Fever!)
+        // -> burn = 350 bps × 10_000 = 350 -> supply = 9_650.
         let t1_ns = 3_600_000_000_000u64;
         set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(10_000), t1_ns);
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
-        assert_eq!(c.get_crucible_temp(), 1000);
+        assert_eq!(c.macro_state.total_snacc_supply, 9_650);
+        assert_eq!(c.get_crucible_temp(), 1088); // floor(1000×10_500/9_650)
 
-        // Titik waktu 2: t2 = t1 + 40 detik -> decay = 40 * 50 = 2_000 -> V_decayed = 8_000
-        // temp(t2) = floor(1000 * 8_000 / 10_000) = 800 mK
+        // Titik waktu 2: t2 = t1 + 40 detik -> decay = 2_000 -> V_decayed = 8_500
+        // temp(t2) = floor(1000 × 8_500 / 9_650) = 880 mK (masih Fever > 610)
         let t2_ns = t1_ns + 40 * 1_000_000_000;
         set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(0), t2_ns);
-        assert_eq!(c.get_crucible_temp(), 800);
+        assert_eq!(c.get_crucible_temp(), 880);
 
-        // Setelah 500 detik (decay 25_000 > 10_000) -> saturasi ke 0
+        // Setelah 500 detik (decay 25_000 > 10_500) -> saturasi ke 0
         let t3_ns = t1_ns + 500 * 1_000_000_000;
         set_context_at(ALKEMIS_ID, NearToken::from_yoctonear(0), t3_ns);
         assert_eq!(c.get_crucible_temp(), 0);
@@ -2566,26 +3759,33 @@ mod tests {
         // stake = 10_000 -> supply = 10_000, treasury = 2_000, strain = 8_000
         let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
 
-        // Batas bawah zona tengah: fee = 6_000 -> temp = floor(1000 * 6_000 / 10_000) = 600 mK
-        set_context(ALKEMIS_ID, NearToken::from_yoctonear(6_000));
-        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(6_000));
-        assert_eq!(c.get_crucible_temp(), 600);
+        // Zona Normal baru = [600, 610] (ECON-111: Fever >610, Hypo <600).
+        // Catatan urutan: termostat mengevaluasi suhu dari fee SEBELUM kaki K2/K3
+        // ditambahkan; kaki terlihat oleh evaluasi berikutnya (lazy).
+        // fee 6.100 -> temp inside = 610 -> NORMAL (tepat di batas atas): tanpa burn/rebate.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(6_100));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(6_100));
+        // volume setelah kaki = 6.600 -> view temp = 660.
+        assert_eq!(c.get_crucible_temp(), 660);
         assert_eq!(c.macro_state.total_snacc_burned, 0);
         assert_eq!(c.macro_state.epoch_treasury_spent, 0);
         assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
-        // `DK-033`: fee 6_000 dibagi 50/50 — treasury 2_000+3_000, inflow 3_000.
-        assert_eq!(c.treasury, 5_000);
-        assert_eq!(c.macro_state.epoch_dividend_inflow, 3_000);
+        // `DK-033`: fee 6.100 dibagi 50/50 — treasury 2.000+3.050, inflow 3.050.
+        assert_eq!(c.treasury, 5_050);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 3_050);
 
-        // Batas atas zona tengah: tambah fee = 8_000 -> volume_epoch = 14_000 -> temp = 1400 mK
-        set_context(ALKEMIS_ID, NearToken::from_yoctonear(8_000));
-        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(8_000));
-        assert_eq!(c.get_crucible_temp(), 1400);
-        assert_eq!(c.macro_state.total_snacc_burned, 0);
+        // Satu langkah di atas batas: fee 100 -> temp inside 670 > 610 -> FEVER.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(100));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(100));
+        // burn 350 bps × 100 = 3 -> supply 9.997; volume 6.700+500 = 7.200
+        // -> view temp = floor(1000×7.200/9.997) = 720.
+        assert_eq!(c.get_crucible_temp(), 720);
+        assert_eq!(c.macro_state.total_snacc_burned, 3);
         assert_eq!(c.macro_state.epoch_treasury_spent, 0);
         assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
-        assert_eq!(c.treasury, 9_000); // +4_000 (50% dari 8_000)
-        assert_eq!(c.macro_state.epoch_dividend_inflow, 7_000); // 3_000+4_000
+        // remainder 97: inflow 48, treasury +49.
+        assert_eq!(c.treasury, 5_099);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 3_098);
     }
 
     /// (2) `get_macro_state` konsisten dengan `get_crucible_temp` & serialisasi JSON/Borsh.
@@ -2598,10 +3798,12 @@ mod tests {
 
         let temp = c.get_crucible_temp();
         let view = c.get_macro_state();
-        assert_eq!(temp, 900);
+        // ECON-111: fee 9.000 + kaki 500 -> volume 9.500; temp 950 > 610 (Fever)
+        // -> burn 350 bps × 9.000 = 315 -> supply 9.685; temp = floor(1000×9.500/9.685) = 980.
+        assert_eq!(temp, 980);
         assert_eq!(view.crucible_temp, temp);
-        assert_eq!(view.total_snacc_supply, 10_000);
-        assert_eq!(view.volume_epoch, 9_000);
+        assert_eq!(view.total_snacc_supply, 9_685);
+        assert_eq!(view.volume_epoch, 9_500);
 
         let json = serde_json::to_string(&view).unwrap();
         let back: state::MacroStateView = serde_json::from_str(&json).unwrap();
@@ -2778,6 +3980,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH")]
     fn vc006_apply_body_palsu_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0)); // SEC-113: owner saat deploy
         let mut c = SnaccContract::new();
         let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
@@ -3341,16 +4544,17 @@ mod tests {
         c.synthesize_and_redeem_aether(2, U128(1));
         c.synthesize_and_redeem_aether(3, U128(3));
         c.advance_epoch();
-        // rate = 10_000 × 1e18 / 4 = 2_500e18.
+        // ECON-111: extract ke-2 masuk Fever (temp 683 > 610) -> burn 350 ->
+        // inflow = 5.000 + 4.825 = 9.825; rate = 9.825×1e18/4 = 2.45625e21.
         let pool = c.get_dividend_pool().0 .0;
-        assert_eq!(pool, 10_000); // inflow 5_000 + 5_000
+        assert_eq!(pool, 9_825);
         let p2 = c.claim_industrial_dividend(2, 0).0;
         let p3 = c.claim_industrial_dividend(3, 0).0;
-        assert_eq!(p2, 2_500); // 1 × 2_500e18 / 1e18
-        assert_eq!(p3, 7_500); // 3 × 2_500e18 / 1e18
-        // `TC-DIV-05`: Σ payout ≤ pool; kolam habis tepat.
+        assert_eq!(p2, 2_456); // 1 × rate / 1e18
+        assert_eq!(p3, 7_368); // 3 × rate / 1e18
+        // `TC-DIV-05`: Σ payout ≤ pool; sisa pembulatan 1 tetap di kolam.
         assert!(p2 + p3 <= pool);
-        assert_eq!(c.get_dividend_pool().0 .0, 0);
+        assert_eq!(c.get_dividend_pool().0 .0, 1);
     }
 
     /// Kolam kosong (rate 0) -> `ERR_DIVIDEND_POOL_EMPTY`.
@@ -3426,12 +4630,13 @@ mod tests {
         c.synthesize_and_redeem_aether(3, U128(1)); // strain 3 (kontribusi kecil) lebih dulu
         c.synthesize_and_redeem_aether(2, U128(3));
         c.advance_epoch();
+        // ECON-111: inflow = 5.000 + 4.825 (Fever burn 350) = 9.825; rate = 2.45625e21;
+        // kontribusi 3:1 -> payout 7.368 : 2.456 (pro-rata, bukan first-mover).
         let p3 = c.claim_industrial_dividend(3, 0).0; // urutan klaim dibalik
         let p2 = c.claim_industrial_dividend(2, 0).0;
-        // inflow 10_000; kontribusi 3:1 -> payout 7_500 : 2_500 (pro-rata, bukan first-mover).
-        assert_eq!(p3, 2_500);
-        assert_eq!(p2, 7_500);
-        assert_eq!(p2 + p3, 10_000);
+        assert_eq!(p3, 2_456);
+        assert_eq!(p2, 7_368);
+        assert_eq!(p2 + p3, 9_824);
     }
 
     // ------------------------------------------------------------------
@@ -3789,22 +4994,24 @@ mod tests {
     #[test]
     fn en106_zone_changed_event() {
         let mut c = dk_setup(); // supply 20_000
-        // Extract fee 10_000 -> volume 10_000 -> temp 500 -> NORMAL->HYPO.
+        // Extract fee 10_000 -> temp inside = floor(1000×10.000/20.000) = 500.
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
         let logs = near_sdk::test_utils::get_logs().join("\n");
         assert!(logs.contains(r#""event":"zone_changed""#));
         assert!(logs.contains(r#""from_zone":"NORMAL""#));
         assert!(logs.contains(r#""to_zone":"HYPO""#));
+        // temp inside = floor(1000×10.000/20.000) = 500 (<600 -> HYPO; kaki K2/K3
+        // ditambahkan SETELAH evaluasi suhu, terlihat oleh evaluasi berikutnya).
         assert!(logs.contains(r#""crucible_temp":500"#));
-        // Extract lagi -> volume 20_000 -> temp 1000 -> HYPO->NORMAL.
+        // Extract lagi -> volume 21.000 -> temp 1025 > 610 -> HYPO->FEVER.
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
         let logs = near_sdk::test_utils::get_logs().join("\n");
         assert!(logs.contains(r#""from_zone":"HYPO""#));
-        assert!(logs.contains(r#""to_zone":"NORMAL""#));
-        assert!(logs.contains(r#""crucible_temp":1000"#));
-        assert_eq!(c.macro_state.last_zone, state::MacroZone::Normal);
+        assert!(logs.contains(r#""to_zone":"FEVER""#));
+        assert!(logs.contains(r#""crucible_temp":1025"#));
+        assert_eq!(c.macro_state.last_zone, state::MacroZone::Fever);
     }
 
     /// `EN-107` — top-3 feeder per epoch, batas 3 entri, urut menurun.
@@ -3986,6 +5193,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ERR_TEE_REPLAY")]
     fn sec107_anti_replay_chat_id_sama_ditolak() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0)); // SEC-113: owner saat deploy
         let mut c = SnaccContract::new();
         let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
@@ -4078,5 +5286,986 @@ mod tests {
         // Meski dividen diklaim penuh, total masih rugi bersih (`DK-030`).
         let bal2 = c.snacc_balances.get(&1).copied().unwrap();
         assert!(bal2 + payout < bal0, "rebate+dividen tidak boleh melampaui fee");
+    }
+
+    // ------------------------------------------------------------------
+    // Pipeline #3 — EN-120 (organel merger), EN-121 (koloni), EN-122 (divide),
+    // EN-123 (adopt), EN-125 (risk heat), NPC ADR-30
+    // ------------------------------------------------------------------
+
+    /// `EN-120` — merger menyerap organel (max per slot) + reset `last_allocate_epoch`.
+    #[test]
+    fn en120_splice_organel_max_dan_reset_alokasi() {
+        let mut c = SnaccContract::new();
+        vc007_pair(&mut c); // strain 1 (Extractor) & 2 (Fermenter), milik sama
+        // Organel: dominan mito=2, terserap mito=3 -> 3; nukleus dom=0, abs=1 -> 1.
+        let mut dom = c.strains.get(&1).unwrap().clone();
+        dom.organel.mitokondria = 2;
+        dom.last_allocate_epoch = 7;
+        let _ = c.strains.insert(1, dom);
+        let mut abs = c.strains.get(&2).unwrap().clone();
+        abs.organel.mitokondria = 3;
+        abs.organel.nukleus = 1;
+        let _ = c.strains.insert(2, abs);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.splice_strains(1, 2);
+        assert_eq!(v.organel.mitokondria, 3); // max(2,3)
+        assert_eq!(v.organel.nukleus, 1); // max(0,1)
+        assert_eq!(v.last_allocate_epoch, u64::MAX); // realokasi ATP dibuka kembali
+    }
+
+    /// `EN-120` — hostile takeover juga mewarisi organel + reset alokasi.
+    #[test]
+    fn en120_hostile_organel_max_dan_reset_alokasi() {
+        let mut c = hostile_setup();
+        let mut t = c.strains.get(&1).unwrap().clone();
+        t.organel.lisosom = 4;
+        t.organel.nukleus = 1;
+        t.last_allocate_epoch = 5;
+        let _ = c.strains.insert(1, t);
+        let mut r = c.strains.get(&2).unwrap().clone();
+        r.organel.lisosom = 2;
+        r.organel.nukleus = 3;
+        let _ = c.strains.insert(2, r);
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 117 * 3_600_000_000_000,
+        );
+        let (_, view) = c.hostile_takeover_splice(2, 1, 0);
+        assert_eq!(view.organel.lisosom, 4); // max(2,4)
+        assert_eq!(view.organel.nukleus, 3); // max(3,1)
+        assert_eq!(view.last_allocate_epoch, u64::MAX);
+    }
+
+    /// `EN-121` — `get_colony`: sel hidup milik akun; sel mati tidak masuk koloni.
+    #[test]
+    fn en121_get_colony_filter_sel_hidup() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, SYNTHESIZER_ROLE, 0);
+        let colony = c.get_colony(ALKEMIS_ID.parse().unwrap());
+        assert_eq!(colony.len(), 3);
+        assert!(colony.iter().all(|v| v.owner_id == ALKEMIS_ID));
+        // Likuidasi satu sel -> keluar dari koloni.
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        assert_eq!(c.get_colony(ALKEMIS_ID.parse().unwrap()).len(), 2);
+        assert_eq!(c.colony_active_count(&ALKEMIS_ID.parse().unwrap()), 2);
+        // Koloni akun lain kosong.
+        assert_eq!(c.get_colony(RAIDER.parse().unwrap()).len(), 0);
+    }
+
+    /// `EN-122` — sitokinesis: Σ saldo induk+anak = saldo induk; vitality & spora separuh;
+    /// organel ÷2; gen anak = induk+1; event `strain_divided`.
+    #[test]
+    fn en122_divide_sitokinesis_konservasi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // bal 8_000, vitality 8500
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 7);
+        let mut p = c.strains.get(&1).unwrap().clone();
+        p.organel = state::OrganelleSlots { mitokondria: 3, nukleus: 1, lisosom: 0 };
+        let _ = c.strains.insert(1, p);
+        // `EN-124`: divide butuh anggaran demografi (merges+lyses >= divides) —
+        // inkubasi satu sel korban lalu likuidasi (lyses = 1) sebagai anggaran.
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain 2
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let (parent, child) = c.divide_strain(1);
+        // Σ saldo = 8_000 (`I-01`); vitality & spora separuh.
+        assert_eq!(parent.vitality, 4250);
+        assert_eq!(child.vitality, 4250);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 4_000);
+        // Anak = strain 3 (strain 2 = korban lisis untuk anggaran demografi EN-124).
+        assert_eq!(c.snacc_balances.get(&3).copied().unwrap(), 4_000);
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&4));
+        assert_eq!(c.inventories.get(&(3, "mt:spore-ignis".to_string())), Some(&3));
+        // Organel ÷2: anak floor(3/2)=1 mito, induk sisa 2; nukleus anak 0, induk 1.
+        assert_eq!(child.organel.mitokondria, 1);
+        assert_eq!(parent.organel.mitokondria, 2);
+        assert_eq!(child.organel.nukleus, 0);
+        assert_eq!(parent.organel.nukleus, 1);
+        // Genom diwariskan; gen anak = induk+1; koloni bertambah.
+        assert_eq!(child.generation, 1);
+        assert_eq!(child.role_mask, state::constants::ROLE_EXTRACTOR);
+        assert_eq!(child.efficiency_bps, 10000);
+        assert_eq!(child.owner_id.to_string(), ALKEMIS_ID);
+        assert_eq!(child.vault_subaccount.to_string(), "s-3.snacc-v001.testnet");
+        assert_eq!(child.strain_id, 3);
+        assert_eq!(c.get_colony(ALKEMIS_ID.parse().unwrap()).len(), 2); // induk + anak
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"strain_divided""#));
+        assert!(logs.contains(r#""child_balance":4000"#));
+        // `D8` log hanya dari divide (harvest F6 tidak menulis MnaLog — lihat report).
+        assert_eq!(c.mna_logs.len(), 1);
+    }
+
+    /// `EN-122` — pagar koloni penuh (`MAX_COLONY_SIZE = 5`).
+    #[test]
+    #[should_panic(expected = "ERR_COLONY_FULL")]
+    fn en122_koloni_penuh_ditolak() {
+        let mut c = SnaccContract::new();
+        for _ in 0..5 {
+            let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        }
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.divide_strain(1); // koloni sudah 5
+    }
+
+    /// `EN-122` — pagar generasi (`MAX_GENERATION = 8`).
+    #[test]
+    #[should_panic(expected = "ERR_MAX_GENERATION")]
+    fn en122_max_generation_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let mut p = c.strains.get(&1).unwrap().clone();
+        p.generation = 8;
+        let _ = c.strains.insert(1, p);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.divide_strain(1); // anak gen 9 > 8
+    }
+
+    /// `EN-123` — adopt sukses: bayar book value TANPA premium ke pemilik lama,
+    /// ownership pindah, selamat dari lisis, event `strain_adopted`.
+    #[test]
+    fn en123_adopt_sukses_ownership_pindah() {
+        let mut c = hostile_setup(); // target distress eff 1500; raider milik RAIDER (bal 800_000)
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 2); // book = 8_002
+        let old_owner_bal = c.account_balance(&ALKEMIS_ID.parse().unwrap());
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let v = c.adopt(1, 2, 0);
+        // Ownership pindah ke pemilik raider; target selamat (status tetap hidup).
+        assert_eq!(v.owner_id.to_string(), RAIDER);
+        assert_eq!(c.get_strain(1).owner_id.to_string(), RAIDER);
+        assert_eq!(c.get_strain(1).status, StrainStatus::Active);
+        // Pembayaran: 100% book value ke pemilik lama (tanpa premium, tanpa potongan).
+        assert_eq!(
+            c.account_balance(&ALKEMIS_ID.parse().unwrap()),
+            old_owner_bal + 8_002
+        );
+        assert_eq!(c.snacc_balances.get(&2).copied().unwrap(), 800_000 - 8_002);
+        // Indeks koloni ter-update di dua sisi.
+        assert_eq!(c.colony_active_count(&ALKEMIS_ID.parse().unwrap()), 0);
+        assert_eq!(c.colony_active_count(&RAIDER.parse().unwrap()), 2);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"strain_adopted""#));
+        assert!(logs.contains(r#""book_value":8002"#));
+        assert_eq!(c.mna_logs.len(), 1); // kind Adopt
+    }
+
+    /// `EN-123` — target sehat (eff > 2000) tidak bisa diadopsi.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_DISTRESSED")]
+    fn en123_adopt_bukan_distressed_ditolak() {
+        let mut c = hostile_setup();
+        set_context_at(RAIDER, NearToken::from_yoctonear(0), 3_600_000_000_000);
+        let _ = c.adopt(1, 2, 0);
+    }
+
+    /// `EN-123` — koloni pengadopsi penuh -> `ERR_COLONY_FULL`.
+    #[test]
+    #[should_panic(expected = "ERR_COLONY_FULL")]
+    fn en123_adopt_koloni_penuh_ditolak() {
+        let mut c = hostile_setup();
+        for _ in 0..4 {
+            set_context(RAIDER, NearToken::from_yoctonear(10_000));
+            let _ = c.incubate_strain(role(EXTRACTOR_ROLE), U128(10_000), 0);
+        }
+        // RAIDER kini punya 5 sel aktif -> adopt ke-6 ditolak.
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.adopt(1, 2, 0);
+    }
+
+    /// `EN-123` — target sudah Liquidated -> `ERR_ALREADY_LIQUIDATED`.
+    #[test]
+    #[should_panic(expected = "ERR_ALREADY_LIQUIDATED")]
+    fn en123_adopt_target_liquidated_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(RAIDER, NearToken::from_yoctonear(1_000_000));
+        let _ = c.incubate_strain(role(FERMENTER_ROLE), U128(1_000_000), 0);
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        let _ = c.adopt(1, 2, 0);
+    }
+
+    /// `EN-125` — `get_risk_heat`: dasar proksimitas Fever + bonus burst/dividen; cap 10000.
+    #[test]
+    fn en125_risk_heat_komponen_dan_cap() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        // Fresh: temp 0, tanpa burst, pool 0 -> heat 0.
+        assert_eq!(c.get_risk_heat(), 0);
+        // Komponen 1: suhu naik -> heat = temp × 10000 / fever_threshold(610, ECON-111).
+        c.macro_state.volume_epoch = 300_000_000_000u128; // temp = 1000×3e11/1e12 = 300
+        c.macro_state.last_update_ms = 3_600_000;
+        let expected = 300 * 10_000 / 610; // 4918
+        assert_eq!(c.get_risk_heat(), expected);
+        // Komponen 2: burst aktif +1000.
+        c.macro_state.nutrient_burst_bps = 2_000;
+        c.macro_state.nutrient_burst_until = 1;
+        assert_eq!(c.get_risk_heat(), expected + 1_000);
+        // Komponen 3: kolam dividen ≥ 1% supply +1000.
+        c.macro_state.industrial_dividend_pool = c.macro_state.total_snacc_supply / 100;
+        assert_eq!(c.get_risk_heat(), expected + 2_000);
+        // Cap 10000: temp ekstrem.
+        c.macro_state.volume_epoch = u128::MAX / 4;
+        assert_eq!(c.get_risk_heat(), 10_000);
+        // Surfacing di appetite meter.
+        c.macro_state.volume_epoch = 0;
+        c.macro_state.nutrient_burst_bps = 0;
+        c.macro_state.industrial_dividend_pool = 0;
+        let m = c.get_appetite_meter();
+        assert_eq!(m.risk_heat, 0);
+    }
+
+    /// `ADR-30` — 3 NPC ter-seed dengan profil `D4`.
+    #[test]
+    fn npc_tiga_terseed() {
+        let c = SnaccContract::new();
+        let e = c.get_npc("npc-extractor".to_string());
+        assert_eq!(e.role_archetype, "Pyre-X");
+        assert_eq!(e.wallet_account, "npc-extractor.snacc-v001.near");
+        assert_eq!(e.spores_stock, 500);
+        assert_eq!(e.target_spores_stock, 500);
+        assert_eq!(e.base_spore_price, 100);
+        assert_eq!(c.get_npc("npc-central-arb".to_string()).spores_stock, 1000);
+        assert_eq!(c.get_npc("npc-vulture-ma".to_string()).spores_stock, 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NPC_UNKNOWN")]
+    fn npc_tak_dikenal_ditolak() {
+        let c = SnaccContract::new();
+        let _ = c.get_npc("npc-hantu".to_string());
+    }
+
+    /// `ADR-30`/`I-15` — kuotasi: harga unit = floor(P_base × S_target / S_after), naik saat stok menyusut.
+    #[test]
+    fn npc_quote_formula_kelangkaan() {
+        let c = SnaccContract::new();
+        // extractor 500/500: beli 100 -> S_after 400 -> unit = floor(100×500/400) = 125.
+        let q = c.npc_quote_spores("npc-extractor".to_string(), 100);
+        assert_eq!(q.unit_price_vita, 125);
+        assert_eq!(q.total_cost_snacc, 12_500);
+        assert_eq!(q.npc_spores_stock_after, 400);
+        assert!(q.reasoning_tooltip.contains("Scarcity"));
+        // Beli kecil: harga tetap P_base saat S_after ≥ dekat target (floor pembulatan).
+        let q2 = c.npc_quote_spores("npc-vulture-ma".to_string(), 1);
+        assert_eq!(q2.unit_price_vita, 100); // floor(100×300/299) = 100
+        // Harga naik makin deplet: beli 299 dari vulture -> S_after 1 -> unit = 30.000.
+        let q3 = c.npc_quote_spores("npc-vulture-ma".to_string(), 299);
+        assert_eq!(q3.unit_price_vita, 30_000);
+    }
+
+    /// `I-15` — konservasi persis: Δreserve == −Δsaldo == total_cost; Δstok == Δinventori.
+    #[test]
+    fn npc_buy_konservasi_i15() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // bal 8_000
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        // buy 40 -> S_after 460 -> unit = floor(50_000/460) = 108 -> total 4.320.
+        let q = c.npc_buy_spores(1, "npc-extractor".to_string(), 40);
+        assert_eq!(q.unit_price_vita, 108);
+        assert_eq!(q.total_cost_snacc, 4_320);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000 - 4_320);
+        let npc = c.get_npc("npc-extractor".to_string());
+        assert_eq!(npc.snacc_reserve, 4_320); // == pengurangan saldo (I-15)
+        assert_eq!(npc.spores_stock, 460); // == penambahan inventori (I-15)
+        assert_eq!(npc.trades_executed, 1);
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&40));
+        assert_eq!(c.get_strain(1).state_nonce, 1); // `ADR-29`
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"npc_spores_bought""#));
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NPC_OUT_OF_STOCK")]
+    fn npc_stok_kurang_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.npc_buy_spores(1, "npc-extractor".to_string(), 501);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn npc_buy_non_owner_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        let _ = c.npc_buy_spores(1, "npc-extractor".to_string(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn npc_buy_saldo_kurang_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // bal 8_000
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        // buy 100 -> total 12.500 > 8.000.
+        let _ = c.npc_buy_spores(1, "npc-extractor".to_string(), 100);
+    }
+    // ------------------------------------------------------------------
+    // Pipeline #4 — EN-114..119 (ATP/mitokondria) + kalibrasi ECON-111
+    // ------------------------------------------------------------------
+
+    /// `EN-115`/§13a — rumus `calc_atp_minted`: base + bonus mitokondria +10%/level.
+    #[test]
+    fn atp115_rumus_dan_bonus_mitokondria() {
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        // fee 10 × 10^15 -> base 10; eff 10000 -> 10.
+        assert_eq!(SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 10_000, 0), 10);
+        // Mitokondria +10%/level: L1 -> 11, L2 -> 12, L5 -> 15.
+        assert_eq!(SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 10_000, 1), 11);
+        assert_eq!(SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 10_000, 2), 12);
+        assert_eq!(SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 10_000, 5), 15);
+        // efficiency 5000 -> setengah; fee di bawah 1 unit -> 0.
+        assert_eq!(SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 5_000, 0), 5);
+        assert_eq!(SnaccContract::calc_atp_minted(999, 10_000, 5), 0);
+    }
+
+    /// `EN-114` — inkubasi memberi `INITIAL_ATP = 50` (energi kelahiran).
+    #[test]
+    fn atp114_incubasi_init_50() {
+        let mut c = SnaccContract::new();
+        let v = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert_eq!(v.atp_balance, constants::INITIAL_ATP); // 50
+        assert_eq!(v.last_allocate_epoch, u64::MAX); // belum pernah alokasi
+    }
+
+    /// `EN-06`/§13a — feed mencetak ATP (fee besar ≥ 10^15) + tampil di event `fed`.
+    #[test]
+    fn atp114_feed_mint_atp_dan_event() {
+        let mut c = SnaccContract::new();
+        // stake 1e16 -> saldo strain 8e15 = 8 unit ATP-yocto (cukup untuk 2 feed).
+        let _ = call_incubate(&mut c, 10_000_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        // vitality penuh -> rescue multiplier 10000 -> effective = amount.
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.vitality = constants::VITALITY_CAP;
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(2 * constants::ATP_YOCTO_UNIT));
+        // mitokondria 0 -> atp_minted = 2.
+        assert_eq!(c.get_strain(1).atp_balance, 52);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""atp_minted":2"#), "atp_minted hilang dari event fed");
+        // Bonus mitokondria: set L2 -> feed 5 unit -> minted = floor(5×1.2) = 6.
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.organel.mitokondria = 2;
+        let _ = c.strains.insert(1, v);
+        c.feed_strain(1, U128(5 * constants::ATP_YOCTO_UNIT));
+        assert_eq!(c.get_strain(1).atp_balance, 52 + 6);
+    }
+
+    /// `EN-116`/§13a — konsumsi ATP extract = 1; habis -> `ERR_NOT_ENOUGH_ATP`.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_ENOUGH_ATP")]
+    fn atp116_konsumsi_extract_dan_habis_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(0));
+        assert_eq!(c.get_strain(1).atp_balance, 49);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""purpose":"extract","cost":1"#));
+        // Drain ATP -> extract berikutnya ditolak.
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.atp_balance = 0;
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_ENOUGH_ATP")]
+    fn atp116_transmute_tanpa_atp_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 0);
+        grant(&mut c, "mt:spore-ignis", 2);
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.atp_balance = 1; // transmute butuh 2
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+    }
+
+    /// `EN-116`/§13a — splice 5 & hostile 10.
+    #[test]
+    fn atp116_biaya_splice_dan_hostile() {
+        let mut c = SnaccContract::new();
+        vc007_pair(&mut c);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.splice_strains(1, 2);
+        assert_eq!(c.get_strain(1).atp_balance, 45); // 50 - 5
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""purpose":"splice","cost":5"#));
+        let mut c2 = hostile_setup();
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c2.hostile_takeover_splice(2, 1, 0);
+        assert_eq!(c2.get_strain(2).atp_balance, 40); // 50 - 10
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""purpose":"hostile","cost":10"#));
+    }
+
+    /// `EN-118`/§13a — `allocate_atp`: biaya 1/kenaikan level, event `atp_allocated`.
+    #[test]
+    fn atp118_allocate_siklus_lengkap() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // atp 50
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.allocate_atp(1, 2, 1, 1);
+        assert_eq!(v.organel.mitokondria, 2);
+        assert_eq!(v.organel.nukleus, 1);
+        assert_eq!(v.organel.lisosom, 1);
+        assert_eq!(v.atp_balance, 46); // biaya 2+1+1 = 4
+        assert_eq!(v.last_allocate_epoch, 0);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"atp_allocated""#));
+        assert!(logs.contains(r#""cost":4"#));
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_ALREADY_ALLOCATED")]
+    fn atp118_allocate_dua_kali_seepoch_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.allocate_atp(1, 1, 0, 0);
+        let _ = c.allocate_atp(1, 2, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_ORGANEL_LEVEL_MAX")]
+    fn atp118_level_enam_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.allocate_atp(1, 6, 0, 0);
+    }
+
+    /// `EN-118` — epoch baru membuka alokasi; biaya hanya KENAIKAN level.
+    #[test]
+    fn atp118_epoch_baru_biaya_kenaikan_saja() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.allocate_atp(1, 2, 1, 1); // biaya 4 -> 46
+        c.advance_epoch();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.allocate_atp(1, 3, 1, 1); // kenaikan mito 1 -> biaya 1 -> 45
+        assert_eq!(v.atp_balance, 45);
+        assert_eq!(v.last_allocate_epoch, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn atp118_allocate_non_owner_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        let _ = c.allocate_atp(1, 1, 0, 0);
+    }
+
+    /// `EN-119` — nukleus & lisosom: TIDAK ada efek ekonomi dikarang; tersimpan & tampil.
+    #[test]
+    fn en119_nukleus_lisosom_tampil_tanpa_efek_ekonomi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.allocate_atp(1, 1, 4, 5);
+        let v = c.get_strain(1);
+        assert_eq!(v.organel.nukleus, 4);
+        assert_eq!(v.organel.lisosom, 5);
+        // Satu-satunya efek ekonomi = mitokondria (rumus ATP §13a).
+        assert_eq!(
+            SnaccContract::calc_atp_minted(10 * constants::ATP_YOCTO_UNIT, 10_000, 1),
+            11
+        );
+    }
+
+    /// `ECON-111` — kaki K2/K3/K4 masuk `volume_epoch`; eksklusi wajib tidak masuk.
+    #[test]
+    fn econ111_volume_multikaki_dan_eksklusi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // bal 8.000
+        // K3: extract 1 spora -> +1×5×100 = 500.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(0));
+        assert_eq!(c.macro_state.volume_epoch, 500);
+        // K2+K3: transmute 2 spora -> burn 2, mint 2 -> +2.000 -> total 2.500.
+        // (extractor diberi bit Fermenter via merger manual untuk keperluan test)
+        grant(&mut c, "mt:spore-ignis", 2); // stok cukup untuk 1 batch (2 spora)
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.role_mask = 0b011;
+        let _ = c.strains.insert(1, v);
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+        assert_eq!(c.macro_state.volume_epoch, 2_500);
+        // EKSKLUSI: inkubasi modal TIDAK menambah volume.
+        set_context(RAIDER, NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(EXTRACTOR_ROLE), U128(0), 0);
+        assert_eq!(c.macro_state.volume_epoch, 2_500);
+        // EKSKLUSI: ft_transfer TIDAK menambah volume.
+        fund(&mut c, ALKEMIS_ID, 100);
+        register(&mut c, ALKEMIS_ID);
+        register(&mut c, RAIDER);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer(RAIDER.parse().unwrap(), U128(50), None);
+        assert_eq!(c.macro_state.volume_epoch, 2_500);
+        // K4: likuidasi strain 2 (insolven) -> volume += bounty+recovery = saldo penuh.
+        let bal2 = c.snacc_balances.get(&2).copied().unwrap();
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(2);
+        assert_eq!(c.macro_state.volume_epoch, 2_500 + bal2);
+    }
+    // ------------------------------------------------------------------
+    // Pipeline #5 — LC-16 (nft_transfer), LC-20 (konjugasi), LC-11 (diskon burn),
+    // EN-124 (invariant demografi), SEC-110 (nonce adopt), get_colony_atp
+    // ------------------------------------------------------------------
+
+    /// LC-16 — transplantasi sukses: sel utuh pindah (saldo, spora, organel, ATP),
+    /// indeks koloni dua sisi ter-update, event standard `nep171`.
+    #[test]
+    fn lc16_nft_transfer_sukses() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // bal 8.000, atp 50
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.nft_transfer(
+            ALICE.parse().unwrap(),
+            "1".to_string(),
+            None,
+            Some("transplantasi".to_string()),
+        );
+        let v = c.get_strain(1);
+        assert_eq!(v.owner_id.to_string(), ALICE);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000); // perut ikut
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&3));
+        assert_eq!(v.atp_balance, 50); // ATP ikut vessel
+        // Indeks dua sisi.
+        assert_eq!(c.get_colony(ALKEMIS_ID.parse().unwrap()).len(), 0);
+        assert_eq!(c.get_colony(ALICE.parse().unwrap()).len(), 1);
+        assert_eq!(c.colony_active_count(&ALICE.parse().unwrap()), 1);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""standard":"nep171""#));
+        assert!(logs.contains(r#""event":"nft_transfer""#));
+        assert!(logs.contains(r#""old_owner_id":"alkemis.testnet""#));
+        assert!(logs.contains(r#""new_owner_id":"alice.testnet""#));
+        assert!(logs.contains(r#""token_ids":["1"]"#));
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_YOCTO_REQUIRED")]
+    fn lc16_nft_transfer_tanpa_yocto_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.nft_transfer(ALICE.parse().unwrap(), "1".to_string(), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn lc16_nft_transfer_bukan_pemilik_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(RAIDER, NearToken::from_yoctonear(1));
+        c.nft_transfer(ALICE.parse().unwrap(), "1".to_string(), None, None);
+    }
+
+    /// LC-16 — sel mati tidak dapat dipindah (keputusan tercatat).
+    #[test]
+    #[should_panic(expected = "ERR_ALREADY_LIQUIDATED")]
+    fn lc16_nft_transfer_sel_mati_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.nft_transfer(ALICE.parse().unwrap(), "1".to_string(), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_NOT_FOUND")]
+    fn lc16_nft_transfer_token_tak_ada_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.nft_transfer(ALICE.parse().unwrap(), "99".to_string(), None, None);
+    }
+
+    /// LC-16 — `nft_transfer_call`: penerima menerima (resolve `false`).
+    #[test]
+    fn lc16_transfer_call_diterima() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        let _ = c.nft_transfer_call(
+            ALICE.parse().unwrap(),
+            "1".to_string(),
+            "jual".to_string(),
+            None,
+            None,
+        );
+        // Simulasikan callback: kontrak penerima MENERIMA (false).
+        let mut builder = VMContextBuilder::new();
+        builder
+            .predecessor_account_id("snacc-v001.near".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(3_600_000_000_000);
+        testing_env!(
+            builder.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Successful(
+                near_sdk::serde_json::to_vec(&false).unwrap()
+            )]
+        );
+        c.nft_resolve_transfer(
+            ALKEMIS_ID.parse().unwrap(),
+            ALICE.parse().unwrap(),
+            "1".to_string(),
+        );
+        assert_eq!(c.get_strain(1).owner_id.to_string(), ALICE);
+    }
+
+    /// LC-16 — `nft_transfer_call`: promise gagal -> token kembali ke pemilik lama.
+    #[test]
+    fn lc16_transfer_call_gagal_kembali() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        let _ = c.nft_transfer_call(
+            ALICE.parse().unwrap(),
+            "1".to_string(),
+            "jual".to_string(),
+            None,
+            None,
+        );
+        let mut builder = VMContextBuilder::new();
+        builder
+            .predecessor_account_id("snacc-v001.near".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(3_600_000_000_000);
+        testing_env!(
+            builder.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed]
+        );
+        c.nft_resolve_transfer(
+            ALKEMIS_ID.parse().unwrap(),
+            ALICE.parse().unwrap(),
+            "1".to_string(),
+        );
+        // Kembali ke pemilik lama + indeks pulih.
+        assert_eq!(c.get_strain(1).owner_id.to_string(), ALKEMIS_ID);
+        assert_eq!(c.get_colony(ALKEMIS_ID.parse().unwrap()).len(), 1);
+        assert_eq!(c.get_colony(ALICE.parse().unwrap()).len(), 0);
+    }
+
+    /// LC-20 — konjugasi: trait disalin (sumber tetap), biaya ATP target 2.
+    #[test]
+    fn lc20_conjugate_sukses() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain 2, pemilik sama
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        // Sumber (1) pernah sukses mutasi TEE (trait ada); target (2) belum.
+        let mut f = c.strains.get(&1).unwrap().clone();
+        f.phenotype_trait = Some("Thermo-Aureate".to_string());
+        let _ = c.strains.insert(1, f);
+        let v = c.conjugate_traits(
+            1,
+            2,
+            "Thermo-Aureate".to_string(),
+        );
+        assert_eq!(v.phenotype_trait.as_deref(), Some("Thermo-Aureate"));
+        assert_eq!(v.atp_balance, 48); // 50 - 2 (dibayar target)
+        // Sumber tetap memiliki traitnya (salin, bukan pindah).
+        assert_eq!(
+            c.get_strain(1).phenotype_trait.as_deref(),
+            Some("Thermo-Aureate")
+        );
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"trait_conjugated""#));
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_TRAIT_MISMATCH")]
+    fn lc20_conjugate_trait_mismatch_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain 2, pemilik sama
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.conjugate_traits(1, 2, "Trait-Ngawur".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_NOT_SAME_OWNER")]
+    fn lc20_conjugate_beda_pemilik_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain 1 = ALKEMIS
+        set_context(RAIDER, NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(EXTRACTOR_ROLE), U128(10_000), 0); // strain 2 = RAIDER
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        // caller = RAIDER pemilik sumber (2), tapi target (1) milik ALKEMIS.
+        let mut f = c.strains.get(&2).unwrap().clone();
+        f.phenotype_trait = Some("Thermo-Aureate".to_string());
+        let _ = c.strains.insert(2, f);
+        let _ = c.conjugate_traits(2, 1, "Thermo-Aureate".to_string());
+    }
+
+    /// LC-11 — pemegang `mt:elixir-homeostasis` mendapat diskon 50% burn Fever.
+    #[test]
+    fn lc11_homeostasis_diskon_burn_pemegang() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // supply 10.000
+        let _ = c.inventories.insert((1, "mt:elixir-homeostasis".to_string()), 1);
+        let supply_before = c.macro_state.total_snacc_supply;
+        // fee 20.000 -> temp 2000 > 610 (Fever); burn pemegang = 20.000×350×50/(100×10.000) = 350.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(20_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(20_000));
+        let burn = supply_before - c.macro_state.total_snacc_supply;
+        assert_eq!(burn, 350); // setengah dari 700
+        // Eliksir tidak dikonsumsi (efek pasif).
+        assert_eq!(
+            c.inventories.get(&(1, "mt:elixir-homeostasis".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn lc11_bukan_pemegang_burn_penuh() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let supply_before = c.macro_state.total_snacc_supply;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(20_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(20_000));
+        let burn = supply_before - c.macro_state.total_snacc_supply;
+        assert_eq!(burn, 700); // penuh 350 bps
+    }
+
+    /// EN-124 — gate demografi: divide tanpa anggaran (merges+lyses < divides) ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_BIRTHS_EXCEEDED")]
+    fn en124_gate_tanpa_anggaran_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert_eq!(c.macro_state.total_births, 2);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.divide_strain(1); // divides 1 > merges 0 + lyses 0
+    }
+
+    /// EN-124 — lisis membuka anggaran divide; counter konsisten.
+    #[test]
+    fn en124_gate_dan_counter() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert_eq!(c.macro_state.total_births, 2);
+        // Likuidasi satu sel -> lyses = 1 -> anggaran divide terbuka.
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(2);
+        assert_eq!(c.macro_state.total_lyses, 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.divide_strain(1);
+        assert_eq!(c.macro_state.total_divides, 1);
+        assert_eq!(c.macro_state.total_births, 3); // 2 inkubasi + 1 divide
+        // Invariant: divides (1) <= mergers (0) + lyses (1).
+        assert!(c.macro_state.total_divides
+            <= c.macro_state.total_mergers + c.macro_state.total_lyses);
+    }
+
+    /// EN-124 — hostile menaikkan `total_mergers`.
+    #[test]
+    fn en124_hostile_menaikkan_mergers() {
+        let mut c = hostile_setup();
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+        assert_eq!(c.macro_state.total_mergers, 1);
+        assert_eq!(c.macro_state.total_births, 2); // 2 inkubasi awal
+        assert_eq!(c.macro_state.total_lyses, 0);
+    }
+
+    /// SEC-110 — `adopt` dengan nonce basi -> `ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED`.
+    #[test]
+    #[should_panic(expected = "ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED")]
+    fn sec110_adopt_stale_nonce_ditolak() {
+        let mut c = hostile_setup();
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.adopt(1, 2, 99); // nonce target = 0
+    }
+
+    /// EN-121 — `get_colony_atp`: Σ ATP koloni aktif.
+    #[test]
+    fn en121_get_colony_atp() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // atp 50
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // atp 50
+        assert_eq!(c.get_colony_atp(ALKEMIS_ID.parse().unwrap()).0, 100);
+        // Feed besar menambah ATP strain 1: +4 -> 104. (fee 4e15 ≤ saldo 8.000? tidak —
+        // gunakan stake besar agar cukup.)
+        let mut c2 = SnaccContract::new();
+        let _ = call_incubate(&mut c2, 1_000_000_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        c2.macro_state.params.dormancy_threshold_bps = 0;
+        let mut v = c2.strains.get(&1).unwrap().clone();
+        v.vitality = constants::VITALITY_CAP;
+        let _ = c2.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c2.feed_strain(1, U128(4 * constants::ATP_YOCTO_UNIT));
+        assert_eq!(c2.get_colony_atp(ALKEMIS_ID.parse().unwrap()).0, 54);
+        // Sel mati tidak dihitung.
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(2);
+        assert_eq!(c.get_colony_atp(ALKEMIS_ID.parse().unwrap()).0, 50);
+    }
+    // ------------------------------------------------------------------
+    // Pipeline #6 — get_inventory (J3.8) & get_global_solvency (J3.9)
+    // ------------------------------------------------------------------
+
+    /// J3.8 — saldo satu molekul; token/strain tak dikenal = 0 (tanpa panic).
+    #[test]
+    fn pipeline6_get_inventory_ada_dan_nol() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 3); // 3 spora genesis
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        assert_eq!(
+            c.get_inventory(1, "mt:spore-ignis".to_string()).0,
+            3
+        );
+        // Token tak dikenal -> 0, tanpa panic.
+        assert_eq!(c.get_inventory(1, "mt:bogus".to_string()).0, 0);
+        // Strain tak dikenal -> 0, tanpa panic.
+        assert_eq!(c.get_inventory(99, "mt:spore-ignis".to_string()).0, 0);
+        // Setelah transmute: spora berkurang, enzim muncul.
+        // `grant` MENIMPA (bukan menambah): 3 genesis -> 5 -> burn 2 -> 3.
+        grant(&mut c, "mt:spore-ignis", 5);
+        // Beri bit Fermenter (extractor + fermenter) agar transmute sah.
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.role_mask = 0b011;
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+        assert_eq!(c.get_inventory(1, "mt:spore-ignis".to_string()).0, 3);
+        assert_eq!(c.get_inventory(1, "mt:enzyme-amalgam".to_string()).0, 2);
+    }
+
+    /// J3.9 — `V-04` solvent sepanjang rentetan aksi (inkubasi, fee, feed,
+    /// transmute, likuidasi, NPC) + `drift == 0` di setiap titik.
+    #[test]
+    fn pipeline6_solvency_solvent_setelah_aksi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 2); // supply 10.000
+        // Dua bit peran (extract untuk fee + ferment untuk transmute).
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.role_mask = 0b011;
+        let _ = c.strains.insert(1, v);
+        let s0 = c.get_global_solvency();
+        assert!(s0.solvent, "drift {}", s0.drift);
+        // Fee katalis (inflow eksternal NEAR-yocto).
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(100));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(100));
+        let s1 = c.get_global_solvency();
+        assert!(s1.solvent, "drift setelah extract: {}", s1.drift);
+        assert_eq!(s1.total_catalyst_fees, 100);
+        // Feed (debit saldo strain + rebate hypo).
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.feed_strain(1, U128(1_000));
+        assert!(c.get_global_solvency().solvent);
+        // Transmute (K2/K3 volume; burn spora, mint enzim — tak sentuh $SNACC).
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(0));
+        assert!(c.get_global_solvency().solvent);
+        // NPC buy (kas strain -> reserve NPC).
+        let _ = c.npc_buy_spores(1, "npc-vulture-ma".to_string(), 1);
+        let s4 = c.get_global_solvency();
+        assert!(s4.solvent, "drift setelah NPC: {}", s4.drift);
+        assert_eq!(s4.sum_npc_reserve, c.get_npc("npc-vulture-ma".to_string()).snacc_reserve);
+        // Likuidasi strain lain (bounty -> akun; recovery -> treasury).
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1);
+        let s5 = c.get_global_solvency();
+        assert!(s5.solvent, "drift setelah likuidasi: {}", s5.drift);
+        // Konsistensi dengan `get_macro_state`.
+        let macro_view = c.get_macro_state();
+        assert_eq!(
+            s5.total_minted,
+            macro_view.total_snacc_supply + macro_view.total_snacc_burned
+        );
+        assert_eq!(s5.total_burned, macro_view.total_snacc_burned);
+        assert_eq!(s5.sum_treasury, c.treasury);
+        assert_eq!(s5.sum_dividend_pool, macro_view.industrial_dividend_pool);
+        assert_eq!(s5.epoch_dividend_inflow, macro_view.epoch_dividend_inflow);
+    }
+
+    /// J3.9 — pembukuan rusak (disuntik) terdeteksi: `solvent = false`, drift dilaporkan.
+    #[test]
+    fn pipeline6_solvency_drift_terdeteksi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        assert!(c.get_global_solvency().solvent);
+        // Simulasi bug pembukuan: agregat dimanipulasi langsung.
+        c.macro_state.sum_strain_snacc += 5;
+        let s = c.get_global_solvency();
+        assert!(!s.solvent);
+        assert_eq!(s.drift, -5);
     }
 }

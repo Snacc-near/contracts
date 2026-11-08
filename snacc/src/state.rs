@@ -14,8 +14,10 @@ pub type Epoch = u64;
 pub mod constants {
     /// Guardrail mutasi TEE (`ADR-21`): `maxShiftBps = ±1500`.
     pub const MAX_SHIFT_BPS: u16 = 1500;
-    /// Calcination Fever saat `CrucibleTemp > 1400` mK.
-    pub const FEVER_THRESHOLD_MK: u64 = 1400;
+    /// Calcination Fever saat `CrucibleTemp > 610` mK — **ECON-111 FINAL (keputusan
+    /// pemilik 2026-11-08, supersede 1400)**: kalibrasi Opsi B `VOLUME_SCALE = 5`.
+    /// (Hypothermia tetap 600 mK; zona Normal = [600, 610].)
+    pub const FEVER_THRESHOLD_MK: u64 = 610;
     /// Hypothermia Rebate saat `CrucibleTemp < 600` mK.
     pub const HYPOTHERMIA_THRESHOLD_MK: u64 = 600;
     /// `ft_burn 350 bps` (3,5%) pada biaya katalis saat Fever.
@@ -73,7 +75,10 @@ pub mod constants {
     pub const ERR_STRAIN_NOT_FOUND: &str = "ERR_STRAIN_NOT_FOUND";
     /// `F1` — token spora genesis `NEP-245` (`Katalog Molekul`, `DFD P1.3`).
     pub const GENESIS_SPORE_TOKEN_ID: &str = "mt:spore-ignis";
-    /// `ADR-02` — format sub-account kanonik `s-<id>.snacc-v001.near`.
+    /// `ADR-02` — format sub-account. **Superseded pipeline #7**: suffix kini
+    /// diturunkan dari `env::current_account_id()` (parent kontrak selalu ada —
+    /// hardcode `.snacc-v001.near` gagal di testnet). Konstanta dipertahankan
+    /// hanya sebagai dokumentasi format mainnet.
     pub const VAULT_SUBACCOUNT_SUFFIX: &str = ".snacc-v001.near";
     /// `F2` — pemulihan metabolik per transmutasi sukses: `vitality +500`.
     pub const METABOLIC_RECOVERY_VITALITY: u64 = 500;
@@ -114,6 +119,14 @@ pub mod constants {
     pub const ERR_BAD_HEX: &str = "ERR_BAD_HEX";
     pub const ERR_BAD_SIGNATURE_LEN: &str = "ERR_BAD_SIGNATURE_LEN";
     pub const ERR_NOT_CONTRACT_OWNER: &str = "ERR_NOT_CONTRACT_OWNER";
+    /// SEC-113 — menimpa kunci TEE terdaftar dengan attestation berbeda ditolak.
+    pub const ERR_TEE_SIGNER_OVERWRITE: &str = "ERR_TEE_SIGNER_OVERWRITE";
+    /// DK-070 — kunci TEE yang mau dihapus tidak terdaftar.
+    pub const ERR_TEE_SIGNER_NOT_FOUND: &str = "ERR_TEE_SIGNER_NOT_FOUND";
+    /// DK-073 — respons TEE melewati batas ukuran.
+    pub const ERR_TEE_RESPONSE_TOO_LARGE: &str = "ERR_TEE_RESPONSE_TOO_LARGE";
+    /// DK-074 — `phenotype_trait` di luar daftar putih / terlalu panjang.
+    pub const ERR_TEE_TRAIT_INVALID: &str = "ERR_TEE_TRAIT_INVALID";
     /// `F5` — kode error merger (nama `ERR_NOT_SAME_OWNER` dari spec F5).
     pub const ERR_NOT_SAME_OWNER: &str = "ERR_NOT_SAME_OWNER";
     pub const ERR_SAME_STRAIN: &str = "ERR_SAME_STRAIN";
@@ -188,6 +201,52 @@ pub mod constants {
     /// `LC-14`: Fever → Extractor murah, Famine → Synthesizer murah; lainnya 0).
     pub const DIET_FEVER_EXTRACTOR_BPS: u16 = 2000;
     pub const DIET_FAMINE_SYNTHESIZER_BPS: u16 = 2000;
+    /// `EN-122`/`EN-124` — kode error pagar koloni (nama keputusan tercatat).
+    pub const ERR_COLONY_FULL: &str = "ERR_COLONY_FULL";
+    pub const ERR_MAX_GENERATION: &str = "ERR_MAX_GENERATION";
+    /// `ADR-30` — kode error NPC (keputusan tercatat; spec tidak menamai).
+    pub const ERR_NPC_UNKNOWN: &str = "ERR_NPC_UNKNOWN";
+    pub const ERR_NPC_OUT_OF_STOCK: &str = "ERR_NPC_OUT_OF_STOCK";
+    pub const ERR_BAD_AMOUNT: &str = "ERR_BAD_AMOUNT";
+    /// `ADR-30`/`ECON-111` — harga dasar `P_base = 100` (§13a; final ECON-111:
+    /// `VOLUME_SCALE` menjadi satu-satunya knob kalibrasi).
+    pub const P_BASE: u128 = 100;
+    /// Alias NPC (nama lama dipertahankan untuk pembacaan spec `ADR-30`).
+    pub const NPC_P_BASE: u128 = P_BASE;
+    /// `ECON-111` FINAL — `VOLUME_SCALE = 5`: pengali nilai $SNACC-ekuivalen per unit
+    /// molekul pada kaki K2/K3 `V_epoch` (econ-report-3 §1; supersede EN-117 "1000 sementara").
+    pub const VOLUME_SCALE: u128 = 5;
+    /// EN-119 (keputusan pemilik 2026-11-08) — Nukleus: output produksi
+    /// +`NUCLEUS_OUTPUT_BPS_PER_LEVEL` bps (10%)/level — mengalikan hasil `minted`
+    /// pada `transmute_spores_to_enzyme` & `synthesize_elixir`.
+    pub const NUCLEUS_OUTPUT_BPS_PER_LEVEL: u128 = 1000;
+    /// EN-119 — Lisosom: BMR −`LYSOSOME_BMR_BPS_PER_LEVEL` bps (10%)/level
+    /// (umur lebih panjang); BMR efektif = `bmr × (10000 − 1000×lisosom)/10000` (min 0).
+    pub const LYSOSOME_BMR_BPS_PER_LEVEL: u128 = 1000;
+    /// EN-117 (keputusan pemilik 2026-11-08 — suhu literal ATP): `V_epoch` =
+    /// kaki ekonomi + `atp_minted × ATP_VOLUME_SCALE`. Nilai dikalibrasi sweep
+    /// ECON-111 varian ATP (econ-report-4): `S_sim = 3000` → porsi ATP 37% dari
+    /// feed (share = S/(5100+S)); kontrak: share = S_c/(10^15+S_c) → S_c = 6×10^14
+    /// (feed 10^15 → 1 ATP → 6×10^14 volume). Fever 8,5%, populasi 73, solvent ✓.
+    pub const ATP_VOLUME_SCALE: u128 = 600_000_000_000_000;
+    /// `EN-114`/§13a — ATP awal per Strain baru (energi kelahiran).
+    pub const INITIAL_ATP: u128 = 50;
+    /// `EN-114`/§13a — `0,001 NEAR katalis = 1 ATP` (unit yocto-scale fee).
+    pub const ATP_YOCTO_UNIT: u128 = 1_000_000_000_000_000;
+    /// `EN-118`/§13a — level organel maksimum.
+    pub const MAX_ORGANEL_LEVEL: u8 = 5;
+    /// `EN-114..118` — kode error (nama §13a/brief).
+    pub const ERR_NOT_ENOUGH_ATP: &str = "ERR_NOT_ENOUGH_ATP";
+    /// Pipeline #5 — kode error baru (keputusan tercatat; spec tidak menamai).
+    pub const ERR_TRAIT_MISMATCH: &str = "ERR_TRAIT_MISMATCH";
+    pub const ERR_BIRTHS_EXCEEDED: &str = "ERR_BIRTHS_EXCEEDED";
+    pub const ERR_ALREADY_ALLOCATED: &str = "ERR_ALREADY_ALLOCATED";
+    pub const ERR_ORGANEL_LEVEL_MAX: &str = "ERR_ORGANEL_LEVEL_MAX";
+    /// `ADR-30` — stok target NPC (keputusan tercatat; contoh tooltip Model Data memakai
+    /// 500/500): extractor baseline 500, central-arb inventori besar 1000, vulture 300.
+    pub const NPC_TARGET_EXTRACTOR: u64 = 500;
+    pub const NPC_TARGET_CENTRAL_ARB: u64 = 1000;
+    pub const NPC_TARGET_VULTURE: u64 = 300;
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
@@ -299,6 +358,9 @@ pub struct StrainVessel {
     pub generation: u8,
     /// Set organel (`EN-07`); diwariskan saat merger = endosimbiosis (`EN-120`).
     pub organel: OrganelleSlots,
+    /// `EN-118`/`EN-120` — epoch terakhir `allocate_atp` (1× per epoch); di-reset 0
+    /// pasca-merger agar realokasi ATP bisa dilakukan epoch yang sama (`EN-120`).
+    pub last_allocate_epoch: Epoch,
     pub status: StrainStatus,
 }
 
@@ -321,6 +383,7 @@ pub struct StrainVesselView {
     pub phenotype_trait: Option<String>,
     pub generation: u8,
     pub organel: OrganelleSlots,
+    pub last_allocate_epoch: Epoch,
     pub status: StrainStatus,
     /// Vitalitas efektif terhitung untuk `now` (Lazy BMR, `ADR-22`).
     pub effective_vitality: u64,
@@ -345,6 +408,7 @@ impl StrainVessel {
             phenotype_trait: self.phenotype_trait.clone(),
             generation: self.generation,
             organel: self.organel.clone(),
+            last_allocate_epoch: self.last_allocate_epoch,
             status: self.status.clone(),
             effective_vitality: self.effective_vitality(now_sec),
         }
@@ -352,9 +416,18 @@ impl StrainVessel {
 
     /// `effective_vitality = vitality - elapsed_hours * bmr_per_hour` (Lazy BMR).
     pub fn effective_vitality(&self, now_sec: u64) -> u64 {
+        // EN-119 — Lisosom: BMR efektif = bmr × (10000 − 1000×level)/10000
+        // (level ≤ 5 → BMR efektif ≥ 50% bmr; min 0 dijaga cap level).
+        let bmr_eff = self.bmr_per_hour
+            * (10_000u64
+                .saturating_sub(
+                    u64::from(self.organel.lisosom)
+                        * u64::from(crate::state::constants::LYSOSOME_BMR_BPS_PER_LEVEL as u16),
+                ))
+            / 10_000;
         let elapsed_hours = now_sec.saturating_sub(self.last_fed_sec) / 3600;
         self.vitality
-            .saturating_sub(elapsed_hours.saturating_mul(self.bmr_per_hour))
+            .saturating_sub(elapsed_hours.saturating_mul(bmr_eff))
     }
 
     /// Pengunci mutasi saldo/inventori (`ADR-29`) — tolak bila ada async berjalan
@@ -464,6 +537,22 @@ pub struct MacroState {
     /// `EN-104` — akumulasi diskon burst yang sudah diberikan epoch berjalan
     /// (cap bersama kuota `I-04` = 5% Pantry/epoch; anti-boros treasury).
     pub epoch_burst_discount_granted: u128,
+    /// Pipeline #6 — pembukuan agregat untuk invarian `V-04` (`get_global_solvency`):
+    /// LookupMap tidak bisa diiterasi, maka agregat dipelihara inkremental oleh
+    /// helper `set_strain_snacc`/`set_account_balance` (satu-satunya jalur tulis ledger).
+    pub sum_strain_snacc: u128,
+    pub sum_account_balances: u128,
+    pub sum_npc_reserve: u128,
+    /// Pipeline #6 — akumulasi katalis fee (NEAR-yocto, inflow eksternal) yang masuk
+    /// bucket treasury/pool — sisi pemasukan invarian di luar minted `$SNACC`.
+    pub total_catalyst_fees: u128,
+    /// `EN-124` — counter demografi (D6): births = inkubasi + divide;
+    /// mergers = splice + hostile; lyses = harvest. `total_divides` = pembukuan
+    /// turunan (bagian births dari divide) untuk gate invariant.
+    pub total_births: u128,
+    pub total_mergers: u128,
+    pub total_lyses: u128,
+    pub total_divides: u128,
     pub params: TermostatParams,
 }
 
@@ -486,6 +575,14 @@ impl Default for MacroState {
             epoch_feast_volume: 0,
             last_zone: MacroZone::Normal,
             epoch_burst_discount_granted: 0,
+            sum_strain_snacc: 0,
+            sum_account_balances: 0,
+            sum_npc_reserve: 0,
+            total_catalyst_fees: 0,
+            total_births: 0,
+            total_mergers: 0,
+            total_lyses: 0,
+            total_divides: 0,
             params: TermostatParams::default(),
         }
     }
@@ -514,6 +611,16 @@ pub struct MacroStateView {
     pub last_zone: MacroZone,
     /// `EN-104` — akumulasi diskon burst epoch berjalan (mirror `MacroState`).
     pub epoch_burst_discount_granted: u128,
+    /// Pipeline #6 — pembukuan agregat (mirror) + drift `V-04`.
+    pub sum_strain_snacc: u128,
+    pub sum_account_balances: u128,
+    pub sum_npc_reserve: u128,
+    pub total_catalyst_fees: u128,
+    /// `EN-124` — counter demografi (mirror).
+    pub total_births: u128,
+    pub total_mergers: u128,
+    pub total_lyses: u128,
+    pub total_divides: u128,
     pub params: TermostatParams,
     /// Suhu makro terhitung (`mK`, lazy decay tanpa cron — `ADR-04`).
     pub crucible_temp: u64,
@@ -536,7 +643,12 @@ impl MacroState {
     pub fn crucible_temp_at(&self, now_ms: u64) -> u64 {
         let v_decayed = self.decayed_volume(now_ms);
         let denom = std::cmp::max(self.total_snacc_supply, 1);
-        (v_decayed.saturating_mul(1000) / denom) as u64
+        // DK-026 — suhu = 1000 × (V/M): rasio VELOCITY, invarian satuan — V dan M
+        // sama-sama yocto, jadi aktivitas proporsional (V = c×M) menghasilkan suhu
+        // yang sama di supply 10^18..10^30 yocto (property test qa_dk026_*).
+        // Saturating + clamp u64: tanpa wrap di skala ekstrem.
+        let t = v_decayed.saturating_mul(1000) / denom;
+        t.min(u64::MAX as u128) as u64
     }
 
     /// Bangun `MacroStateView` dengan `crucible_temp` pada `now_ms`.
@@ -558,6 +670,14 @@ impl MacroState {
             epoch_feast_volume: self.epoch_feast_volume,
             last_zone: self.last_zone,
             epoch_burst_discount_granted: self.epoch_burst_discount_granted,
+            sum_strain_snacc: self.sum_strain_snacc,
+            sum_account_balances: self.sum_account_balances,
+            sum_npc_reserve: self.sum_npc_reserve,
+            total_catalyst_fees: self.total_catalyst_fees,
+            total_births: self.total_births,
+            total_mergers: self.total_mergers,
+            total_lyses: self.total_lyses,
+            total_divides: self.total_divides,
             params: self.params.clone(),
             crucible_temp: self.crucible_temp_at(now_ms),
         }
@@ -599,6 +719,32 @@ pub struct NftTokenView {
     pub token_id: String,
     pub owner_id: AccountId,
     pub metadata: NftMetadataView,
+}
+
+/// Agen Pedagang & Arbitraseur NPC Otonom On-Chain (`D4` / `ADR-30`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NpcMerchantAgent {
+    pub npc_id: String,
+    pub wallet_account: String,
+    pub role_archetype: String,
+    pub snacc_reserve: u128,
+    pub spores_stock: u64,
+    pub target_spores_stock: u64,
+    pub base_spore_price: u128,
+    pub trades_executed: u64,
+}
+
+/// Output kuotasi NPC on-chain + reasoning tooltip (`ADR-30`, Model Data — serialisasi json).
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NpcQuoteView {
+    pub npc_id: String,
+    pub unit_price_vita: u128,
+    pub total_cost_snacc: u128,
+    pub npc_spores_stock_after: u64,
+    pub crucible_temp_mk: u64,
+    pub reasoning_tooltip: String,
 }
 
 /// Bukti attestation TEE (`D5`) — disimpan dari `apply_tee_mutation_zero_trust` (`ADR-21`).
@@ -648,7 +794,7 @@ mod tests {
         StrainVessel {
             strain_id: 1,
             owner_id: "alkemis.testnet".parse().unwrap(),
-            vault_subaccount: "s-1.snacc-v001.near".parse().unwrap(),
+            vault_subaccount: "s-1.snacc-v001.testnet".parse().unwrap(),
             vitality: 2500,
             efficiency_bps: 10000,
             bmr_per_hour: 100,
@@ -661,6 +807,7 @@ mod tests {
             phenotype_trait: None,
             generation: 0,
             organel: OrganelleSlots { mitokondria: 1, nukleus: 0, lisosom: 0 },
+            last_allocate_epoch: 3,
             status: StrainStatus::Active,
         }
     }
@@ -685,7 +832,8 @@ mod tests {
     #[test]
     fn vc002_kamus_angka_terkunci() {
         let p = TermostatParams::default();
-        assert_eq!(p.fever_threshold_mk, 1400);
+        // ECON-111 FINAL (keputusan pemilik 2026-11-08): Fever >610 mK (supersede 1400).
+        assert_eq!(p.fever_threshold_mk, 610);
         assert_eq!(p.hypothermia_threshold_mk, 600);
         assert_eq!(p.fever_burn_bps, 350);
         assert_eq!(p.rebate_bps, 200);
