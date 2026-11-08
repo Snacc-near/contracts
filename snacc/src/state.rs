@@ -161,6 +161,33 @@ pub mod constants {
     pub const BURST_DURATION_EPOCHS: u64 = 1;
     /// `N141` — deposit storage minimum MVP = 5 milliNEAR (keputusan tercatat).
     pub const STORAGE_DEPOSIT_MILLINEAR: u128 = 5;
+    /// `F5` Jalur 2 — kode error: target tidak berada di Tier 2 Chapter 11 Distressed
+    /// (`1 <= effective_vitality <= 2000`). Nama keputusan tercatat (spec tidak menamai).
+    pub const ERR_NOT_DISTRESSED: &str = "ERR_NOT_DISTRESSED";
+    /// `F5` Jalur 2 — pembayaran buyout = `book_value × (10000 + HOSTILE_PREMIUM_BPS) / 10000`
+    /// (`ADR-26`: Book Value + 15% Restructuring Premium).
+    pub const HOSTILE_SELLER_BPS: u128 = 9500; // 95% pembayaran ke pemilik lama
+    pub const HOSTILE_TREASURY_BPS: u128 = 500; // 5% ke Rule-Bound Treasury
+    /// `F5` Jalur 2 — `floor_price` molekul belum ternominalisasi di spec → keputusan
+    /// tercatat: 1 unit `$SNACC` per unit molekul (transparan, mudah diganti).
+    pub const MOLECULE_FLOOR_PRICE: u128 = 1;
+    /// `EN-02`/`EN-105` — Great Feast (keputusan tercatat: target & band tidak
+    /// ternominalisasi di spec): target volume feed/epoch = 5% dari total supply,
+    /// band Goldilocks = ±20% dari target.
+    pub const FEAST_TARGET_BPS: u128 = 500;
+    pub const FEAST_BAND_BPS: u128 = 2000;
+    /// `EN-108` — dormansi: tarif upkeep feed turun ke `UPKEEP_MIN_BPS` (`50` bps,
+    /// dari Peta Koneksi D7) saat `decayed_volume < ambang`. Ambang = keputusan
+    /// tercatat: 1% dari total supply (`DORMANCY_THRESHOLD_BPS`).
+    pub const UPKEEP_MIN_BPS: u128 = 50;
+    pub const DORMANCY_THRESHOLD_BPS: u64 = 100;
+    /// `EN-109` — rescue feeding (keputusan tercatat: linear; fee minimum `20%`
+    /// saat `effective_vitality -> 0`, penuh `100%` di `effective_vitality = 10000`).
+    pub const RESCUE_MIN_FEE_BPS: u128 = 2000;
+    /// `EN-110` — matriks diet per kasta per zona (keputusan tercatat; arah dari
+    /// `LC-14`: Fever → Extractor murah, Famine → Synthesizer murah; lainnya 0).
+    pub const DIET_FEVER_EXTRACTOR_BPS: u16 = 2000;
+    pub const DIET_FAMINE_SYNTHESIZER_BPS: u16 = 2000;
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
@@ -349,6 +376,26 @@ impl StrainVessel {
     }
 }
 
+/// Zona makro (`EN-106`) — disimpan untuk deteksi transisi `zone_changed`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum MacroZone {
+    #[default]
+    Normal,
+    Fever,
+    Hypothermia,
+}
+
+impl MacroZone {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MacroZone::Normal => "NORMAL",
+            MacroZone::Fever => "FEVER",
+            MacroZone::Hypothermia => "HYPO",
+        }
+    }
+}
+
 /// Parameter termostat moneter (`D7`) — semua nilai mengikuti Kamus Angka Resmi.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
@@ -360,6 +407,9 @@ pub struct TermostatParams {
     pub max_epoch_treasury_drain_bps: u16,
     pub volume_decay_per_sec: u64,
     pub max_shift_bps: u16,
+    /// `EN-108` — ambang dormansi (`%` supply × 100): dormansi saat
+    /// `decayed_volume < supply × dormancy_threshold_bps / 10000`.
+    pub dormancy_threshold_bps: u64,
 }
 
 impl Default for TermostatParams {
@@ -373,6 +423,7 @@ impl Default for TermostatParams {
             max_epoch_treasury_drain_bps: MAX_EPOCH_TREASURY_DRAIN_BPS,
             volume_decay_per_sec: VOLUME_DECAY_PER_SEC,
             max_shift_bps: MAX_SHIFT_BPS,
+            dormancy_threshold_bps: DORMANCY_THRESHOLD_BPS,
         }
     }
 }
@@ -406,6 +457,10 @@ pub struct MacroState {
     pub epoch_aether_burned_total: u128,
     /// Epoch terakhir yang ditutup (`advance_epoch`, `DK-033`).
     pub last_closed_epoch: Epoch,
+    /// `EN-105` — akumulasi volume feed (`effective_fee` `feed_strain`) epoch berjalan.
+    pub epoch_feast_volume: u128,
+    /// `EN-106` — zona makro terakhir yang terdeteksi (untuk event `zone_changed`).
+    pub last_zone: MacroZone,
     /// `EN-104` — akumulasi diskon burst yang sudah diberikan epoch berjalan
     /// (cap bersama kuota `I-04` = 5% Pantry/epoch; anti-boros treasury).
     pub epoch_burst_discount_granted: u128,
@@ -428,6 +483,8 @@ impl Default for MacroState {
             epoch_dividend_inflow: 0,
             epoch_aether_burned_total: 0,
             last_closed_epoch: 0,
+            epoch_feast_volume: 0,
+            last_zone: MacroZone::Normal,
             epoch_burst_discount_granted: 0,
             params: TermostatParams::default(),
         }
@@ -451,6 +508,10 @@ pub struct MacroStateView {
     pub epoch_dividend_inflow: u128,
     pub epoch_aether_burned_total: u128,
     pub last_closed_epoch: Epoch,
+    /// `EN-105` — akumulasi volume feed epoch berjalan (mirror `MacroState`).
+    pub epoch_feast_volume: u128,
+    /// `EN-106` — zona makro terakhir (mirror).
+    pub last_zone: MacroZone,
     /// `EN-104` — akumulasi diskon burst epoch berjalan (mirror `MacroState`).
     pub epoch_burst_discount_granted: u128,
     pub params: TermostatParams,
@@ -494,6 +555,8 @@ impl MacroState {
             epoch_dividend_inflow: self.epoch_dividend_inflow,
             epoch_aether_burned_total: self.epoch_aether_burned_total,
             last_closed_epoch: self.last_closed_epoch,
+            epoch_feast_volume: self.epoch_feast_volume,
+            last_zone: self.last_zone,
             epoch_burst_discount_granted: self.epoch_burst_discount_granted,
             params: self.params.clone(),
             crucible_temp: self.crucible_temp_at(now_ms),
@@ -509,6 +572,14 @@ impl MacroState {
             0
         }
     }
+}
+
+/// `EN-107` — entri leaderboard feeder (Great Feast; maksimal 3 per epoch).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeederEntry {
+    pub account_id: AccountId,
+    pub amount: u128,
 }
 
 /// Metadata `NEP-177` (subset yang dibutuhkan wallet: title/description/media).

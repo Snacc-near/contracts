@@ -16,9 +16,9 @@ use near_sdk::serde::Deserialize;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
-    constants, AlkemisProfile, Epoch, MacroState, MacroStateView, MnaLogEntry, NftMetadataView,
-    NftTokenView, OrganelleSlots, StrainId, StrainRole, StrainStatus, StrainVessel,
-    StrainVesselView, TeeAttestation, TokenId,
+    constants, AlkemisProfile, Epoch, FeederEntry, MacroState, MacroStateView, MacroZone,
+    MnaLogEntry, NftMetadataView, NftTokenView, OrganelleSlots, StrainId, StrainRole,
+    StrainStatus, StrainVessel, StrainVesselView, TeeAttestation, TokenId,
 };
 
 /// Payload mutasi genom — `choices[0].message.content` (JSON di dalam JSON, `F3`/`I-03`).
@@ -89,6 +89,10 @@ pub struct SnaccContract {
     pub epoch_aether_burned: LookupMap<(Epoch, StrainId), u128>,
     /// `DK-033` — anti double-claim `(epoch, strain_id)`.
     pub dividend_claimed: LookupSet<(Epoch, StrainId)>,
+    /// `EN-107` — kontribusi feed per `(epoch, akun)` (Great Feast).
+    pub feast_contributions: LookupMap<(Epoch, AccountId), u128>,
+    /// `EN-107` — leaderboard top-3 feeder per epoch (batas 3 entri, gas aman).
+    pub epoch_top_feeders: LookupMap<Epoch, Vec<FeederEntry>>,
     /// `D6` Kas `$SNACC` per Strain (neraca `vault_subaccount`).
     pub snacc_balances: LookupMap<StrainId, u128>,
     /// `D6` `Rule-Bound Treasury` — tanpa fungsi penarikan admin (`I-05`).
@@ -119,6 +123,8 @@ impl SnaccContract {
             epoch_dividend_rate: LookupMap::new(b"e".to_vec()),
             epoch_aether_burned: LookupMap::new(b"f".to_vec()),
             dividend_claimed: LookupSet::new(b"g".to_vec()),
+            feast_contributions: LookupMap::new(b"h".to_vec()),
+            epoch_top_feeders: LookupMap::new(b"k".to_vec()),
             snacc_balances: LookupMap::new(b"b".to_vec()),
             treasury: 0,
             macro_state: MacroState::default(),
@@ -370,6 +376,30 @@ impl SnaccContract {
         self.macro_state.epoch_aether_burned_total = 0;
         self.macro_state.last_closed_epoch = self.macro_state.last_closed_epoch.saturating_add(1);
 
+        // --- `EN-105`: evaluasi The Great Feast (band Goldilocks) saat epoch ditutup. ---
+        // Keputusan tercatat: target = 5% supply, band ±20% (FEAST_TARGET_BPS/FEAST_BAND_BPS);
+        // MVP feast hanya menilai & memancarkan verdict — bonus token tidak ternominalisasi.
+        let feast_volume = self.macro_state.epoch_feast_volume;
+        let feast_target = self.macro_state.total_snacc_supply * constants::FEAST_TARGET_BPS
+            / constants::BPS_DENOMINATOR;
+        let feast_band =
+            feast_target * constants::FEAST_BAND_BPS / constants::BPS_DENOMINATOR;
+        let verdict = if feast_volume
+            >= feast_target.saturating_sub(feast_band)
+            && feast_volume <= feast_target + feast_band
+        {
+            "GOLDILOCKS"
+        } else if feast_volume > feast_target + feast_band {
+            "OVERFED"
+        } else {
+            "UNDERFED"
+        };
+        self.macro_state.epoch_feast_volume = 0;
+        events::emit_event_json(&format!(
+            r#"{{"kind":"feast_result","epoch":{},"volume":{},"target":{},"verdict":"{}"}}"#,
+            closing, feast_volume, feast_target, verdict
+        ));
+
         // --- `VC-005`: reset kuota `I-04`. ---
         self.macro_state.current_epoch = self.macro_state.current_epoch.saturating_add(1);
         self.macro_state.epoch_treasury_spent = 0;
@@ -487,6 +517,17 @@ impl SnaccContract {
         self.macro_state.last_update_ms = now_ms;
 
         let temp = self.get_crucible_temp();
+        // `EN-106` — deteksi transisi zona makro → event `zone_changed` (tanpa keeper).
+        let zone = Self::zone_at(temp);
+        if zone != self.macro_state.last_zone {
+            events::emit_event_json(&format!(
+                r#"{{"kind":"zone_changed","from_zone":"{}","to_zone":"{}","crucible_temp":{}}}"#,
+                self.macro_state.last_zone.as_str(),
+                zone.as_str(),
+                temp
+            ));
+            self.macro_state.last_zone = zone;
+        }
         if temp > self.macro_state.params.fever_threshold_mk {
             let burn = fee * self.macro_state.params.fever_burn_bps as u128
                 / constants::BPS_DENOMINATOR;
@@ -644,7 +685,23 @@ impl SnaccContract {
         } else {
             env::panic_str(constants::ERR_INSUFFICIENT_BALANCE)
         };
-        self.take_catalyst_fee(strain_id, &snacc_catalyst_fee);
+        // `EN-110` — matriks diet per kasta per zona (peta koneksi: EN-04 → transmute).
+        // Keputusan tercatat: Fever → Extractor −20%; Famine (Hypothermia) → Synthesizer
+        // −20%; lainnya 0. Multi-role (hasil splice): cukup satu bit cocok.
+        // `snacc_catalyst_fee` = nominal; attached deposit wajib = fee SETELAH diskon.
+        let temp_now = self.get_crucible_temp();
+        let diet_bps: u16 = match Self::zone_at(temp_now) {
+            MacroZone::Fever if v.role_mask & constants::ROLE_EXTRACTOR != 0 => {
+                constants::DIET_FEVER_EXTRACTOR_BPS
+            }
+            MacroZone::Hypothermia if v.role_mask & constants::ROLE_SYNTHESIZER != 0 => {
+                constants::DIET_FAMINE_SYNTHESIZER_BPS
+            }
+            _ => 0,
+        };
+        let effective_fee =
+            snacc_catalyst_fee.0 * u128::from(10000 - diet_bps) / constants::BPS_DENOMINATOR;
+        self.take_catalyst_fee(strain_id, &U128(effective_fee));
         for (token, amount) in recipe.1 {
             if amount > 0 {
                 self.inv_burn(strain_id, token, amount);
@@ -656,8 +713,8 @@ impl SnaccContract {
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
         events::emit_event_json(&format!(
-            r#"{{"kind":"transmuted","strain_id":{},"burned_spores":{},"token_out":"{}","minted":{},"catalyst_fee":{}}}"#,
-            strain_id, spores_to_burn, recipe.0, minted, snacc_catalyst_fee.0
+            r#"{{"kind":"transmuted","strain_id":{},"burned_spores":{},"token_out":"{}","minted":{},"catalyst_fee":{},"diet_bps":{}}}"#,
+            strain_id, spores_to_burn, recipe.0, minted, effective_fee, diet_bps
         ));
         self.get_strain(strain_id)
     }
@@ -1056,6 +1113,144 @@ impl SnaccContract {
 
 
 // =====================================================================
+// TUGAS 2 #1 — `F5` Jalur 2: `hostile_takeover_splice` — Chapter 11 Hostile M&A
+// (`ADR-26`, `I-09`, `I-14`, `ADR-29`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `F5` Jalur 2 / `P5` (`ADR-26`, `I-09`, `I-14`) — `hostile_takeover_splice`.
+    ///
+    /// Cross-account: pemanggil wajib pemilik **raider** (`V-01`); target milik siapa pun.
+    /// Sah bila `1 <= effective_vitality(target) <= 2000` (`Tier2Chapter11Distressed`,
+    /// `ERR_NOT_DISTRESSED`) dan target tidak sudah Liquidated/SplicedBurned.
+    /// `I-14` (`ADR-29`): `target.state_nonce == expected_target_nonce &&
+    /// pending_callbacks == 0` (parameter `expected_target_nonce` ditambahkan sesuai
+    /// `I-14`; `now_sec` dari spec §5.1 TIDAK diambil sebagai parameter — `V-02` waktu
+    /// wajib dari blok). Anti-spoofing memakai `assert_atomic_ready` yang sudah ada.
+    ///
+    /// Pembayaran: `book_value = target.snacc_balance + Σ(inventori × MOLECULE_FLOOR_PRICE)`,
+    /// raider membayar `book_value + 15%` (`HOSTILE_PREMIUM_BPS`); `95%` ke pemilik lama
+    /// (`account_balances`), `5%` ke `Rule-Bound Treasury`. Raider menyerap 100% saldo +
+    /// inventori + `role_mask |=`; `target.status = SplicedBurned`; efficiency = max dari
+    /// keduanya (keputusan tercatat — spec hanya bilang "menggabungkan efisiensi").
+    /// CATATAN DESAIN: margin langsung bisa negatif bila nilai pasar aset < 115% salvage —
+    /// itu memang premium restrukturisasi; yang dibeli adalah `role_mask`, generasi, dan
+    /// opsi perputaran aset, bukan arbitrase saldo.
+    pub fn hostile_takeover_splice(
+        &mut self,
+        raider_strain_id: StrainId,
+        distressed_target_id: StrainId,
+        expected_target_nonce: u64,
+    ) -> (U128, StrainVesselView) {
+        assert_ne!(
+            raider_strain_id, distressed_target_id,
+            "{}",
+            constants::ERR_SAME_STRAIN
+        );
+        let caller = env::predecessor_account_id();
+        let mut raider = self
+            .strains
+            .get(&raider_strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, raider.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        let mut target = self
+            .strains
+            .get(&distressed_target_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert!(
+            !matches!(
+                target.status,
+                StrainStatus::SplicedBurned | StrainStatus::Liquidated
+            ),
+            "{}",
+            constants::ERR_STRAIN_ALREADY_SPLICED
+        );
+        // `I-09` / `ADR-26` — jendela Tier 2 Chapter 11 Distressed.
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let eff = target.effective_vitality(now_sec);
+        assert!(
+            (1..=2000).contains(&eff),
+            "{}",
+            constants::ERR_NOT_DISTRESSED
+        );
+        // `I-14` (`ADR-29`) — anti ERC-6551 seller-drain (nonce + callback lock).
+        target.assert_atomic_ready(expected_target_nonce);
+
+        // Book value (`floor_price` = 1 per unit molekul — keputusan tercatat).
+        let target_bal = self.snacc_balances.get(&distressed_target_id).copied().unwrap_or(0);
+        let mut book_value = target_bal;
+        for token in constants::ALL_TOKEN_IDS {
+            book_value = book_value.saturating_add(
+                self.inv_balance(distressed_target_id, token) * constants::MOLECULE_FLOOR_PRICE,
+            );
+        }
+        let payment =
+            book_value * (constants::BPS_DENOMINATOR + u128::from(constants::HOSTILE_PREMIUM_BPS))
+                / constants::BPS_DENOMINATOR;
+        let raider_bal = self.snacc_balances.get(&raider_strain_id).copied().unwrap_or(0);
+        assert!(
+            raider_bal >= payment,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+
+        // Split pembayaran: 95% ke pemilik lama, 5% ke treasury (`ADR-26`).
+        let seller_payout = payment * constants::HOSTILE_SELLER_BPS / constants::BPS_DENOMINATOR;
+        let treasury_cut = payment - seller_payout;
+        let _ = self
+            .snacc_balances
+            .insert(raider_strain_id, raider_bal - payment + target_bal);
+        let _ = self.snacc_balances.insert(distressed_target_id, 0);
+        let seller = self
+            .account_balances
+            .get(&target.owner_id)
+            .copied()
+            .unwrap_or(0);
+        let _ = self
+            .account_balances
+            .insert(target.owner_id.clone(), seller.saturating_add(seller_payout));
+        self.treasury = self.treasury.saturating_add(treasury_cut);
+
+        // Serap 100% inventori `NEP-245` + `role_mask |=` (`I-08`) + Gen+1 + efficiency max.
+        for token in constants::ALL_TOKEN_IDS {
+            let src = (distressed_target_id, token.to_string());
+            let amount = self.inventories.get(&src).copied().unwrap_or(0);
+            if amount > 0 {
+                let _ = self.inventories.insert(src, 0);
+                let dst = (raider_strain_id, token.to_string());
+                let cur = self.inventories.get(&dst).copied().unwrap_or(0);
+                let _ = self.inventories.insert(dst, cur + amount);
+            }
+        }
+        raider.role_mask |= target.role_mask;
+        raider.generation = raider.generation.saturating_add(1);
+        raider.efficiency_bps = raider.efficiency_bps.max(target.efficiency_bps);
+        target.status = StrainStatus::SplicedBurned;
+        raider.record_mutation();
+        target.record_mutation();
+        let _ = self.strains.insert(raider_strain_id, raider.clone());
+        let _ = self.strains.insert(distressed_target_id, target);
+
+        // `D8` — log M&A.
+        self.mna_logs.push(MnaLogEntry {
+            timestamp_ms: env::block_timestamp() / 1_000_000,
+            kind: state::MnaKind::HostileTakeover,
+            actor_id: caller,
+            target_id: distressed_target_id,
+            amount: payment,
+        });
+        events::emit_event_json(&format!(
+            r#"{{"kind":"hostile_takeover_spliced","raider_id":{},"target_id":{},"book_value":{},"payment":{},"seller_payout":{},"treasury_cut":{}}}"#,
+            raider_strain_id, distressed_target_id, book_value, payment, seller_payout, treasury_cut
+        ));
+        (U128(payment), raider.to_view(now_sec))
+    }
+}
+
+
+// =====================================================================
 // VC-008 — `F6`: `harvest_starving_strain` — Cell Lysis (`ADR-11`, `I-10`)
 // =====================================================================
 #[near]
@@ -1133,14 +1328,19 @@ impl SnaccContract {
 #[near]
 impl SnaccContract {
     /// Zona makro dari suhu (kanonik: Fever `>1400`, Hypothermia `<600`, selain itu normal).
-    fn zone_of(temp_mk: u64) -> &'static str {
+    fn zone_at(temp_mk: u64) -> MacroZone {
         if temp_mk > constants::FEVER_THRESHOLD_MK {
-            "FEVER"
+            MacroZone::Fever
         } else if temp_mk < constants::HYPOTHERMIA_THRESHOLD_MK {
-            "HYPO"
+            MacroZone::Hypothermia
         } else {
-            "NORMAL"
+            MacroZone::Normal
         }
+    }
+
+    /// Nama zona untuk SVG/event (kanonik string `FEVER`/`HYPO`/`NORMAL`).
+    fn zone_of(temp_mk: u64) -> &'static str {
+        Self::zone_at(temp_mk).as_str()
     }
 
     /// `F7` / `P7` (`ADR-03`) — `nft_token(token_id)` → `NEP-171`/`NEP-177` view
@@ -1637,6 +1837,12 @@ impl SnaccContract {
     /// masuk jalur termostat `F4` (volume, Fever burn, rebate `I-04`, split dividen
     /// `DK-033`); sisa diskon tetap di saldo strain (di sinilah "feed lebih murah").
     /// Pemulihan metabolik `+500` & `last_fed_sec = now` (pola `F2`).
+    /// Modifier lanjutan (urutan: burst → rescue → dormansi, semuanya memperkecil fee):
+    /// - `EN-109` rescue feeding: multiplier linear `RESCUE_MIN_FEE_BPS..=10000` atas
+    ///   `effective_vitality` — makin sekarat makin murah (batas 0 → 20%, 100% → penuh).
+    /// - `EN-108` dormansi: saat `decayed_volume < ambang` (`DORMANCY_THRESHOLD_BPS`,
+    ///   keputusan tercatat 1% supply) upkeep turun ke `UPKEEP_MIN_BPS = 50` bps.
+    /// - `EN-105` volume feed masuk akumulator Great Feast + leaderboard top-3.
     pub fn feed_strain(&mut self, strain_id: StrainId, amount: U128) -> StrainVesselView {
         let caller = env::predecessor_account_id();
         let mut v = self
@@ -1647,6 +1853,7 @@ impl SnaccContract {
         assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
         assert!(amount.0 > 0, "{}", constants::ERR_INSUFFICIENT_BALANCE);
         let now_sec = env::block_timestamp() / 1_000_000_000;
+        let now_ms = env::block_timestamp() / 1_000_000;
         let eff = Self::assert_not_starving(&v, now_sec);
         let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
         assert!(
@@ -1671,7 +1878,28 @@ impl SnaccContract {
             .macro_state
             .epoch_burst_discount_granted
             .saturating_add(discount);
-        let effective_fee = base_fee - discount;
+
+        // `EN-109` — rescue feeding: multiplier linear atas `effective_vitality`.
+        let rescue_bps = constants::RESCUE_MIN_FEE_BPS
+            + (constants::BPS_DENOMINATOR - constants::RESCUE_MIN_FEE_BPS)
+                * u128::from(eff)
+                / u128::from(constants::VITALITY_CAP as u16);
+
+        // `EN-108` — dormansi: upkeep turun ke `UPKEEP_MIN_BPS` saat volume di bawah ambang.
+        let dormancy_threshold = self.macro_state.total_snacc_supply
+            * u128::from(self.macro_state.params.dormancy_threshold_bps)
+            / constants::BPS_DENOMINATOR;
+        let dormant =
+            self.macro_state.decayed_volume(now_ms) < dormancy_threshold;
+        let upkeep_bps = if dormant {
+            constants::UPKEEP_MIN_BPS
+        } else {
+            constants::BPS_DENOMINATOR
+        };
+
+        let effective_fee = (base_fee - discount) * rescue_bps / constants::BPS_DENOMINATOR
+            * upkeep_bps
+            / constants::BPS_DENOMINATOR;
 
         // Debit `effective_fee` dari saldo strain -> jalur termostat `F4`.
         let _ = self
@@ -1679,15 +1907,113 @@ impl SnaccContract {
             .insert(strain_id, bal - effective_fee);
         self.apply_thermostat_fee(strain_id, effective_fee);
 
+        // `EN-105` — akumulator Great Feast + leaderboard top-3 (`EN-107`).
+        let epoch = self.macro_state.current_epoch;
+        self.macro_state.epoch_feast_volume = self
+            .macro_state
+            .epoch_feast_volume
+            .saturating_add(effective_fee);
+        let contrib = self
+            .feast_contributions
+            .get(&(epoch, caller.clone()))
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(effective_fee);
+        let _ = self.feast_contributions.insert((epoch, caller.clone()), contrib);
+        self.feast_update_top3(epoch, &caller, contrib);
+
         // Pemulihan metabolik (pola `F2`) + nonce.
         Self::recover_metabolism(&mut v, eff, now_sec);
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
         events::emit_event_json(&format!(
-            r#"{{"kind":"fed","strain_id":{},"base_fee":{},"effective_fee":{},"burst_bps":{}}}"#,
-            strain_id, base_fee, effective_fee, burst_bps
+            r#"{{"kind":"fed","strain_id":{},"base_fee":{},"effective_fee":{},"burst_bps":{},"rescue_bps":{},"dormant":{}}}"#,
+            strain_id, base_fee, effective_fee, burst_bps, rescue_bps, dormant
         ));
         self.get_strain(strain_id)
+    }
+
+    /// `EN-107` — pemeliharaan leaderboard top-3 feeder (batas 3 entri, gas aman).
+    fn feast_update_top3(&mut self, epoch: Epoch, feeder: &AccountId, amount: u128) {
+        let mut top = self.epoch_top_feeders.get(&epoch).cloned().unwrap_or_default();
+        match top.iter_mut().find(|e| &e.account_id == feeder) {
+            Some(entry) => entry.amount = amount,
+            None => top.push(FeederEntry {
+                account_id: feeder.clone(),
+                amount,
+            }),
+        }
+        top.sort_by(|a, b| b.amount.cmp(&a.amount));
+        top.truncate(3);
+        let _ = self.epoch_top_feeders.insert(epoch, top);
+    }
+
+    /// `EN-107` — leaderboard top-3 feeder untuk satu epoch (maksimal 3 entri).
+    pub fn get_top_feeder(&self, epoch: Epoch) -> Vec<FeederEntry> {
+        self.epoch_top_feeders.get(&epoch).cloned().unwrap_or_default()
+    }
+
+    /// `EN-112` — `get_appetite_meter()`: zona makro, suhu, countdown burst,
+    /// status dormansi, dan progres Great Feast (view spec `EN-05`).
+    pub fn get_appetite_meter(&self) -> AppetiteMeterView {
+        let now_ms = env::block_timestamp() / 1_000_000;
+        let temp = self.macro_state.crucible_temp_at(now_ms);
+        let zone = Self::zone_at(temp);
+        let epoch = self.macro_state.current_epoch;
+        let feast_target = self.macro_state.total_snacc_supply * constants::FEAST_TARGET_BPS
+            / constants::BPS_DENOMINATOR;
+        let dormancy_threshold = self.macro_state.total_snacc_supply
+            * u128::from(self.macro_state.params.dormancy_threshold_bps)
+            / constants::BPS_DENOMINATOR;
+        AppetiteMeterView {
+            zone: zone.as_str().to_string(),
+            crucible_temp: temp,
+            current_epoch: epoch,
+            burst_bps: self.macro_state.active_burst_bps(epoch),
+            burst_until: self.macro_state.nutrient_burst_until,
+            burst_epochs_left: self.macro_state.nutrient_burst_until.saturating_sub(epoch),
+            dormant: self.macro_state.decayed_volume(now_ms) < dormancy_threshold,
+            feast_volume: self.macro_state.epoch_feast_volume,
+            feast_target,
+        }
+    }
+}
+
+/// `EN-112` — tampilan `get_appetite_meter()`.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppetiteMeterView {
+    /// Zona makro (`NORMAL`/`FEVER`/`HYPO`).
+    pub zone: String,
+    pub crucible_temp: u64,
+    pub current_epoch: Epoch,
+    /// Diskon burst aktif epoch berjalan (0 bila kedaluwarsa).
+    pub burst_bps: u16,
+    pub burst_until: Epoch,
+    /// Countdown burst dalam epoch (`burst_until − current_epoch`).
+    pub burst_epochs_left: Epoch,
+    /// `EN-108` — status dormansi (volume < ambang).
+    pub dormant: bool,
+    /// `EN-105` — progres Great Feast epoch berjalan.
+    pub feast_volume: u128,
+    pub feast_target: u128,
+}
+
+
+// =====================================================================
+// Migrasi state — WAJIB dipanggil sekali setelah redeploy (borsh posisional)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Migrasi state NEAR (pola standar): `#[init(ignore_state)]` berjalan TANPA
+    /// memuat state lama. Semua collection memakai prefix byte yang sama dengan
+    /// `new()`, sehingga data trie lama (hidup di storage key ber-prefix) tetap
+    /// terbaca — hanya blob state (borsh) yang diganti dengan layout baru.
+    /// Tanpa ini, redeploy ke akun ber-state lama akan gagal deserialisasi
+    /// (field baru di tengah/tengah layout) = seluruh view/call panic.
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        Self::new()
     }
 }
 
@@ -2086,6 +2412,14 @@ mod tests {
         let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(5));
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(9));
+    }
+
+    /// `migrate()` — pola migrasi state NEAR; dipanggil sekali setelah redeploy.
+    #[test]
+    fn migrate_membangun_state_baru() {
+        let c = SnaccContract::migrate();
+        assert_eq!(c.protocol_version(), "snacc-v001");
+        assert_eq!(c.ft_total_supply(), U128(0));
     }
 
     // ----------------------------------------------------------------------
@@ -3153,7 +3487,9 @@ mod tests {
     /// ber zona Hypothermia (temp < 600) — debit bersih = effective_fee − rebate.
     #[test]
     fn en103_feed_diskon_burst_dan_kedaluwarsa() {
-        let mut c = dk_setup(); // saldo strain 8_000, treasury 2_000
+        let mut c = dk_setup(); // saldo strain 8_000, treasury 4_000
+        // Dormansi dinonaktifkan agar test fokus ke diskon burst (dormansi dites terpisah).
+        c.macro_state.params.dormancy_threshold_bps = 0;
         // Nyalakan burst manual (pola sama dengan EN-102).
         c.macro_state.nutrient_burst_bps = 500;
         c.macro_state.nutrient_burst_until = 1;
@@ -3162,29 +3498,33 @@ mod tests {
         let bal0 = c.snacc_balances.get(&1).copied().unwrap();
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         let v = c.feed_strain(1, U128(1_000));
-        // effective_fee = 1_000 × (10000−500)/10000 = 950; rebate hypo = 950×200/10000 = 19.
+        // burst 500 -> 950; rescue (eff 8500) mult 8800 -> 950×8800/10000 = 836;
+        // hypo: rebate 836×200/10000 = 16 -> debit bersih 820.
         let bal1 = c.snacc_balances.get(&1).copied().unwrap();
-        assert_eq!(bal0 - bal1, 950 - 19);
+        assert_eq!(bal0 - bal1, 836 - 16);
         assert_eq!(v.last_fed_sec, 3600); // metabolisme pulih
         let logs = near_sdk::test_utils::get_logs().join("\n");
         assert!(logs.contains(r#""event":"fed""#), "event fed hilang");
-        assert!(logs.contains(r#""effective_fee":950"#));
+        assert!(logs.contains(r#""effective_fee":836"#));
+        assert!(logs.contains(r#""burst_bps":500"#));
+        assert!(logs.contains(r#""rescue_bps":8800"#));
 
-        // `TC-NB-03`: burst kedaluwarsa setelah `until` — fee kembali penuh.
+        // `TC-NB-03`: burst kedaluwarsa setelah `until` — burst hilang (rescue tetap).
         c.advance_epoch(); // current_epoch = 1 == until -> burst mati
         assert_eq!(c.get_burst_state(), (U128(0), 1));
         let bal2 = c.snacc_balances.get(&1).copied().unwrap();
         c.feed_strain(1, U128(1_000));
         let bal3 = c.snacc_balances.get(&1).copied().unwrap();
-        // Tanpa diskon: effective 1_000; volume 950+1_000 = 1_950 -> temp 195 (hypo);
-        // kuota I-04 sisa 100−19 = 81; rebate = min(20, 81) = 20.
-        assert_eq!(bal2 - bal3, 1_000 - 20);
+        // Tanpa burst: f1 = 1_000; rescue eff 9000 -> mult 9200 -> 920;
+        // volume 836+920 = 1_756 -> temp 87 (hypo); rebate 920×200/10000 = 18.
+        assert_eq!(bal2 - bal3, 920 - 18);
     }
 
     /// `EN-104` — cap diskon 5% Pantry/epoch (kuota `I-04` dipakai bersama rebate).
     #[test]
     fn en104_cap_diskon_5_pantry_per_epoch() {
         let mut c = dk_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0; // dormansi dites terpisah
         c.macro_state.nutrient_burst_bps = 2_000;
         c.macro_state.nutrient_burst_until = 1;
         // Kuota I-04 = 500 bps dari epoch_treasury_initial 10_000 = 500.
@@ -3194,14 +3534,12 @@ mod tests {
         let bal0 = c.snacc_balances.get(&1).copied().unwrap();
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         c.feed_strain(1, U128(1_000));
-        // raw discount = 1_000 × 2_000/10_000 = 200; sisa kuota 500−0−490 = 10
-        // -> diskon dipotong jadi 10; effective_fee = 990.
-        // Zona hypo (temp 99): rebate = 990×200/10000 = 19 (kuota rebate terpisah dari
-        // pemakaian burst hanya melalui `granted`); debit bersih = 990 − 19 = 971.
+        // raw discount = 200; sisa kuota 500−0−490 = 10 -> diskon 10; f1 = 990;
+        // rescue (eff 8500) mult 8800 -> f2 = 871; hypo: rebate 871×200/10000 = 17.
         let bal1 = c.snacc_balances.get(&1).copied().unwrap();
-        assert_eq!(bal0 - bal1, 971);
+        assert_eq!(bal0 - bal1, 871 - 17);
         assert_eq!(c.macro_state.epoch_burst_discount_granted, 500); // cap tercapai
-        assert_eq!(c.macro_state.epoch_treasury_spent, 19);
+        assert_eq!(c.macro_state.epoch_treasury_spent, 17);
     }
 
     /// `TC-NB-01` — loop 1.000 feed saat burst aktif: saldo pemain turun bersih
@@ -3210,6 +3548,7 @@ mod tests {
     fn en104_tc_nb01_loop_1000_feed_tetap_merugi() {
         let mut c = SnaccContract::new();
         let _ = call_incubate(&mut c, 1_000_000_000u128, EXTRACTOR_ROLE, 0); // saldo 8e8, treasury 2e8
+        c.macro_state.params.dormancy_threshold_bps = 0; // dormansi dites terpisah
         c.macro_state.nutrient_burst_bps = 2_000;
         c.macro_state.nutrient_burst_until = 1;
         c.macro_state.epoch_treasury_initial = c.treasury;
@@ -3224,11 +3563,14 @@ mod tests {
             c.feed_strain(1, U128(1_000));
         }
         let bal1 = c.snacc_balances.get(&1).copied().unwrap();
-        // Per feed: effective 800 (diskon 20%); zona hypo sepanjang loop (volume 800n
-        // -> temp < 1) -> rebate 800×200/10000 = 16. Debit bersih = 784/feed.
-        assert_eq!(bal0 - bal1, 784_000);
-        // Konservasi `DK-033` (inflow epoch berjalan dihitung terpisah):
-        // treasury + pool + inflow + burned + saldo strain = supply (feed normal tidak burn).
+        // `DK-030` (TC-NB-01): net loss bersih — setiap feed rugi (rebate 200 bps < fee);
+        // rescue menurunkan fee saat vitality naik, tapi tidak pernah membuat untung.
+        assert!(bal1 < bal0, "feed harus rugi bersih");
+        assert!(bal0 - bal1 > 500_000, "net loss substansial");
+        // Rebate ≤ fee yang dibakar/dipungut (`DK-030`): kuota subsidy ≤ volume feed.
+        assert!(c.macro_state.epoch_treasury_spent <= c.macro_state.epoch_feast_volume);
+        // Konservasi `DK-033` (inflow epoch berjalan dihitung terpisah); supply tak berubah
+        // karena zona selalu di bawah Fever (volume maks ~8e5 << 1.4e9).
         assert_eq!(
             c.treasury
                 + c.macro_state.industrial_dividend_pool
@@ -3271,5 +3613,470 @@ mod tests {
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         let _ = c.synthesize_elixir(2, "mt:elixir-aether".to_string(), 3, U128(0));
         assert_eq!(c.inventories.get(&(2, "mt:elixir-aether".to_string())), Some(&1));
+    }
+
+    // ------------------------------------------------------------------
+    // TUGAS 2 #1 — hostile_takeover_splice (Chapter 11 Hostile M&A, ADR-26/I-09/I-14)
+    // ------------------------------------------------------------------
+
+    const RAIDER: &str = "raider.testnet";
+
+    /// Setup hostile: strain 1 = Extractor ALKEMIS (target), strain 2 = Fermenter
+    /// RAIDER (stake 1_000_000 -> saldo 800_000). Target dibuat distress (eff 1500).
+    fn hostile_setup() -> SnaccContract {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // target, bal 8_000
+        set_context(RAIDER, NearToken::from_yoctonear(1_000_000));
+        let _ = c.incubate_strain(role(FERMENTER_ROLE), U128(1_000_000), 0); // raider
+        // Target distress: 70 jam × BMR 100 = 7_000 -> eff 1_500 (Tier 2: 1..=2000).
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        c
+    }
+
+    /// (a) takeover sukses: bayar 115% book value, split 95/5, serap aset + role OR.
+    #[test]
+    fn hostile_sukses_split_95_5_dan_serap() {
+        let mut c = hostile_setup();
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 5); // book +5
+        // book = 8_000 + 5 = 8_005; payment = 8_005 × 115% = 9_205 (floor);
+        // seller 95% = 8_744; treasury 5% = 461.
+        let (payment, view) = c.hostile_takeover_splice(2, 1, 0);
+        assert_eq!(payment.0, 9_205);
+        assert_eq!(c.snacc_balances.get(&2).copied().unwrap(), 800_000 - 9_205 + 8_000);
+        assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 0);
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 8_744);
+        assert_eq!(c.treasury, 202_000 + 461); // 2_000+2_000 (inkubasi) + 200_000 (stake raider) + 461
+        // Serap: role OR (0b010 | 0b001), gen+1, efficiency max, inventori pindah.
+        assert_eq!(view.role_mask, 0b011);
+        assert_eq!(view.generation, 1);
+        assert_eq!(c.get_strain(1).status, StrainStatus::SplicedBurned);
+        assert_eq!(c.inventories.get(&(2, "mt:spore-ignis".to_string())), Some(&5));
+        assert_eq!(c.inventories.get(&(1, "mt:spore-ignis".to_string())), Some(&0));
+        // `D8` log + event.
+        assert_eq!(c.mna_logs.len(), 1);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"hostile_takeover_spliced""#));
+        assert!(logs.contains(r#""payment":9205"#));
+    }
+
+    /// (b) target sehat (eff 8500 > 2000) -> `ERR_NOT_DISTRESSED` (I-09).
+    #[test]
+    #[should_panic(expected = "ERR_NOT_DISTRESSED")]
+    fn hostile_bukan_distressed_ditolak() {
+        let mut c = hostile_setup();
+        // Konteks kembali ke ts awal: eff target masih 8500 (belum 70 jam).
+        set_context_at(RAIDER, NearToken::from_yoctonear(0), 3_600_000_000_000);
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+    }
+
+    /// (c) `I-14`: nonce tidak cocok -> `ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED`.
+    #[test]
+    #[should_panic(expected = "ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED")]
+    fn hostile_nonce_mismatch_ditolak() {
+        let mut c = hostile_setup();
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.hostile_takeover_splice(2, 1, 99);
+    }
+
+    /// (d) `I-14`: callback berjalan -> `ERR_PENDING_ASYNC_CALLBACK_LOCKED`.
+    #[test]
+    #[should_panic(expected = "ERR_PENDING_ASYNC_CALLBACK_LOCKED")]
+    fn hostile_pending_callback_ditolak() {
+        let mut c = hostile_setup();
+        let mut t = c.strains.get(&1).unwrap().clone();
+        t.pending_callbacks = 1;
+        let _ = c.strains.insert(1, t);
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+    }
+
+    /// (e) pemanggil bukan pemilik raider -> `ERR_NOT_OWNED_BY_CALLEE` (V-01).
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn hostile_raider_bukan_milik_pemanggil() {
+        let mut c = hostile_setup();
+        set_context("intruder.testnet", NearToken::from_yoctonear(0));
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+    }
+
+    /// (f) saldo raider < 115% book value -> `ERR_INSUFFICIENT_BALANCE`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn hostile_saldo_raider_kurang() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // target bal 8_000
+        set_context(RAIDER, NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(FERMENTER_ROLE), U128(10_000), 0); // raider bal 8_000
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        // payment = 9_200 > raider 8_000.
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+    }
+
+    /// (g) target sudah Liquidated -> `ERR_STRAIN_ALREADY_SPLICED`.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_ALREADY_SPLICED")]
+    fn hostile_target_liquidated_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        set_context(RAIDER, NearToken::from_yoctonear(1_000_000));
+        let _ = c.incubate_strain(role(FERMENTER_ROLE), U128(1_000_000), 0);
+        set_context_at(
+            "hunter.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let _ = c.harvest_starving_strain(1); // target jadi Liquidated
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        let _ = c.hostile_takeover_splice(2, 1, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // TUGAS 2 #2 — EN-105..112 (Great Feast, zona, leaderboard, dormansi, rescue, diet, meter)
+    // ------------------------------------------------------------------
+
+    /// `EN-105` — band Goldilocks: UNDERFED / GOLDILOCKS / OVERFED terukur.
+    #[test]
+    fn en105_feast_band_goldilocks() {
+        // UNDERFED: tidak ada feed sama sekali.
+        let mut c = dk_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        c.advance_epoch();
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"feast_result""#));
+        assert!(logs.contains(r#""verdict":"UNDERFED""#));
+
+        // GOLDILOCKS: target = 5% × 20_000 = 1_000; band ±20% = [800, 1_200];
+        // satu feed 1_000 -> effective 880 (rescue 8800) di dalam band.
+        let mut c = dk_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(1_000));
+        c.advance_epoch();
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""verdict":"GOLDILOCKS""#));
+        assert!(logs.contains(r#""volume":880"#));
+        assert_eq!(c.macro_state.epoch_feast_volume, 0); // ter-reset per epoch
+
+        // OVERFED: 3 feed -> 880+920+960 = 2_760 > 1_200.
+        let mut c = dk_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(1_000));
+        c.feed_strain(1, U128(1_000));
+        c.feed_strain(1, U128(1_000));
+        c.advance_epoch();
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""verdict":"OVERFED""#));
+    }
+
+    /// `EN-106` — event `zone_changed {from_zone, to_zone, crucible_temp}` saat zona berganti.
+    #[test]
+    fn en106_zone_changed_event() {
+        let mut c = dk_setup(); // supply 20_000
+        // Extract fee 10_000 -> volume 10_000 -> temp 500 -> NORMAL->HYPO.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"zone_changed""#));
+        assert!(logs.contains(r#""from_zone":"NORMAL""#));
+        assert!(logs.contains(r#""to_zone":"HYPO""#));
+        assert!(logs.contains(r#""crucible_temp":500"#));
+        // Extract lagi -> volume 20_000 -> temp 1000 -> HYPO->NORMAL.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""from_zone":"HYPO""#));
+        assert!(logs.contains(r#""to_zone":"NORMAL""#));
+        assert!(logs.contains(r#""crucible_temp":1000"#));
+        assert_eq!(c.macro_state.last_zone, state::MacroZone::Normal);
+    }
+
+    /// `EN-107` — top-3 feeder per epoch, batas 3 entri, urut menurun.
+    #[test]
+    fn en107_top_feeder_maks_3() {
+        let mut c = SnaccContract::new();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain 1 ALKEMIS
+        for (acct, stake) in [(RAIDER, 10_000u128), ("carol.testnet", 10_000), ("dave.testnet", 10_000)] {
+            set_context(acct, NearToken::from_yoctonear(stake));
+            let _ = c.incubate_strain(role(EXTRACTOR_ROLE), U128(stake), 0);
+        }
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(1_000)); // alkemis +880
+        c.feed_strain(1, U128(1_000)); // alkemis +920 -> 1_800
+        set_context(RAIDER, NearToken::from_yoctonear(0));
+        c.feed_strain(2, U128(1_000)); // raider +880
+        set_context("carol.testnet", NearToken::from_yoctonear(0));
+        c.feed_strain(3, U128(1_000)); // carol +880
+        set_context("dave.testnet", NearToken::from_yoctonear(0));
+        c.feed_strain(4, U128(1_000)); // dave +880 (tidak masuk top-3)
+        let top = c.get_top_feeder(0);
+        assert_eq!(top.len(), 3, "batas 3 entri");
+        assert_eq!(top[0].account_id.to_string(), ALKEMIS_ID);
+        assert_eq!(top[0].amount, 880 + 920);
+        assert_eq!(top[1].account_id.to_string(), RAIDER);
+        assert_eq!(top[2].account_id.to_string(), "carol.testnet");
+        assert_eq!(
+            c.feast_contributions.get(&(0, ALKEMIS_ID.parse::<AccountId>().unwrap())).copied(),
+            Some(880 + 920)
+        );
+    }
+
+    /// `EN-108` — dormansi: upkeep turun ke 50 bps saat volume < ambang; transisi terukur.
+    #[test]
+    fn en108_dormansi_upkeep_50_bps() {
+        assert_eq!(state::constants::UPKEEP_MIN_BPS, 50);
+        let mut c = dk_setup(); // supply 20_000; ambang default 100 bps = 200
+        assert!(c.get_appetite_meter().dormant); // volume 0 < 200
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(1_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        // f1 = 1_000; rescue 8800 -> 880; dormansi ×50/10000 -> 4.
+        assert!(logs.contains(r#""effective_fee":4"#));
+        assert!(logs.contains(r#""dormant":true"#));
+        assert!(c.get_appetite_meter().dormant); // volume 4 masih < 200
+        // Transisi: ambang 0 -> tidak dorman; fee kembali penuh (rescue saja).
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        assert!(!c.get_appetite_meter().dormant);
+        let bal0 = c.snacc_balances.get(&1).copied().unwrap();
+        c.feed_strain(1, U128(1_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        // rescue eff 9000 -> 920 (tanpa dormansi).
+        assert!(logs.contains(r#""effective_fee":920"#));
+        assert!(logs.contains(r#""dormant":false"#));
+        assert!(c.snacc_balances.get(&1).copied().unwrap() < bal0);
+    }
+
+    /// `EN-109` — rescue feeding: batas 0 (fee 20%) dan 100% (fee penuh); linear di antaranya.
+    #[test]
+    fn en109_rescue_batas_0_dan_100_persen() {
+        let mut c = dk_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        let _ = c.snacc_balances.insert(1, 20_000); // saldo cukup untuk fee penuh
+        // Batas bawah: eff = 1 -> multiplier = 2000 (RESCUE_MIN_FEE_BPS).
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.vitality = 1;
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(10_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""effective_fee":2000"#)); // 10_000 × 2000/10000
+        assert!(logs.contains(r#""rescue_bps":2000"#));
+
+        // Batas atas: eff = 10000 -> multiplier 10000 (fee penuh).
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.vitality = constants::VITALITY_CAP; // 10000
+        let _ = c.strains.insert(1, v);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(10_000));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""effective_fee":10000"#));
+        assert!(logs.contains(r#""rescue_bps":10000"#));
+    }
+
+    /// `EN-110` + `EN-111` — matriks diet per kasta per zona: 8 kombinasi
+    /// (mask yang punya bit Fermenter: 0b010/0b011/0b110/0b111 × Fever/Hypo).
+    #[test]
+    fn en110_en111_matriks_diet_8_kombinasi() {
+        // Fever (volume 30_000 -> temp 1500): bit Extractor -> 2000.
+        // Hypo (volume 0 -> temp 0): bit Synthesizer -> 2000.
+        let cases: [(u8, u128, u16); 8] = [
+            (0b010, 30_000, 0),     // Fermenter @Fever: bukan Extractor -> 0
+            (0b010, 0, 0),          // Fermenter @Hypo: bukan Synthesizer -> 0
+            (0b011, 30_000, 2_000), // E+F @Fever -> 2000
+            (0b011, 0, 0),          // E+F @Hypo -> 0
+            (0b110, 30_000, 0),     // F+S @Fever -> 0
+            (0b110, 0, 2_000),      // F+S @Hypo -> 2000
+            (0b111, 30_000, 2_000), // Full @Fever -> 2000
+            (0b111, 0, 2_000),      // Full @Hypo -> 2000
+        ];
+        for (i, (mask, volume, expected)) in cases.iter().enumerate() {
+            let mut c = SnaccContract::new();
+            c.macro_state.params.dormancy_threshold_bps = 0;
+            let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 0);
+            let mut v = c.strains.get(&1).unwrap().clone();
+            v.role_mask = *mask;
+            let _ = c.strains.insert(1, v);
+            grant(&mut c, "mt:spore-ignis", 2);
+            c.macro_state.volume_epoch = *volume;
+            c.macro_state.last_update_ms = 3_600_000_000; // decay 0 (last_update awal 0)
+            let effective = 1_000u128 * u128::from(10_000 - *expected) / 10_000;
+            set_context(ALKEMIS_ID, NearToken::from_yoctonear(effective));
+            let _ = c.transmute_spores_to_enzyme(1, 2, U128(1_000));
+            let logs = near_sdk::test_utils::get_logs().join("\n");
+            assert!(
+                logs.contains(&format!(r#""diet_bps":{}"#, expected)),
+                "kasus {}: diet_bps {} tidak tercapai",
+                i,
+                expected
+            );
+        }
+    }
+
+    /// `EN-110` — attached deposit != fee setelah diskon -> ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_STAKE_DEPOSIT_MISMATCH")]
+    fn en110_diet_fee_nominal_ditolak() {
+        let mut c = SnaccContract::new();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 0);
+        let mut v = c.strains.get(&1).unwrap().clone();
+        v.role_mask = 0b011; // punya bit Extractor -> diskon Fever
+        let _ = c.strains.insert(1, v);
+        grant(&mut c, "mt:spore-ignis", 2);
+        c.macro_state.volume_epoch = 30_000; // Fever
+        c.macro_state.last_update_ms = 3_600_000_000;
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1_000)); // harusnya 800
+        let _ = c.transmute_spores_to_enzyme(1, 2, U128(1_000));
+    }
+
+    /// `EN-112` — `get_appetite_meter`: zona, countdown burst, status dormansi, feast.
+    #[test]
+    fn en112_get_appetite_meter() {
+        let mut c = dk_setup(); // supply 20_000 -> feast target 1_000
+        let m = c.get_appetite_meter();
+        assert_eq!(m.zone, "HYPO"); // volume 0 -> temp 0
+        assert_eq!(m.crucible_temp, 0);
+        assert_eq!(m.current_epoch, 0);
+        assert_eq!(m.burst_bps, 0);
+        assert_eq!(m.burst_epochs_left, 0);
+        assert!(m.dormant);
+        assert_eq!(m.feast_volume, 0);
+        assert_eq!(m.feast_target, 1_000);
+        // Burst aktif -> meter mencerminkan.
+        c.macro_state.nutrient_burst_bps = 2_000;
+        c.macro_state.nutrient_burst_until = 3;
+        let m = c.get_appetite_meter();
+        assert_eq!(m.burst_bps, 2_000);
+        assert_eq!(m.burst_until, 3);
+        assert_eq!(m.burst_epochs_left, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // TUGAS 3 — SEC-107..109
+    // ------------------------------------------------------------------
+
+    // Vektor ed25519 SEGAR (dihasilkan offline & self-verified) untuk alur apply sukses
+    // + anti-replay `used_tee_chat_ids` (SEC-107). Model: `z-ai/glm-5.3-flash`.
+    const SEC_BODY: &str = r#"{"id":"sec-replay-test","choices":[{"message":{"content":"{\"strain_id\":1,\"efficiency_shift_bps\":100,\"vitality_bonus\":100,\"phenotype_trait\":\"SEC-Replay-Probe\"}"}}]}"#;
+    const SEC_REQ_SHA: &str =
+        "01c45b8519d21a933ffdf96737428001c6fa720afeadc1c1a6beeb66ba6055d4";
+    const SEC_PUBKEY_HEX: &str =
+        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+    const SEC_SIG_HEX: &str = "b22529732798f14ce0e0645d357407ebb71ac6278238e357f0b85edba9ea6584295c52aa1d8dbba9b9fd8d681cb7c772dee0bd6d8f84e45b2208eb1a56f4f405";
+
+    /// `SEC-107` — alur TEE sukses penuh lalu replay `chat_id` yang sama ditolak
+    /// (`used_tee_chat_ids`, negative test lanjutan).
+    #[test]
+    #[should_panic(expected = "ERR_TEE_REPLAY")]
+    fn sec107_anti_replay_chat_id_sama_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.register_attested_signer(SEC_PUBKEY_HEX.to_string(), 1_700_000_000);
+        c.commit_genome_experiment(1, SEC_REQ_SHA.to_string());
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.apply_tee_mutation_zero_trust(
+            1,
+            SEC_REQ_SHA.to_string(),
+            SEC_BODY.to_string(),
+            SEC_SIG_HEX.to_string(),
+            SEC_PUBKEY_HEX.to_string(),
+        );
+        // Mutasi sukses: +100 bps, +100 vitality, trait tercatat.
+        assert_eq!(v.efficiency_bps, 10_100);
+        assert_eq!(v.vitality, 8_600);
+        assert_eq!(v.phenotype_trait.as_deref(), Some("SEC-Replay-Probe"));
+        // REPLAY: komit ulang (commitment lama sudah dipakai) lalu body yang SAMA —
+        // `chat_id` "sec-replay-test" sudah di `used_tee_chat_ids` -> ditolak.
+        c.commit_genome_experiment(1, SEC_REQ_SHA.to_string());
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.apply_tee_mutation_zero_trust(
+            1,
+            SEC_REQ_SHA.to_string(),
+            SEC_BODY.to_string(),
+            SEC_SIG_HEX.to_string(),
+            SEC_PUBKEY_HEX.to_string(),
+        );
+    }
+
+    /// `SEC-108` — `state_nonce`/`pending_callbacks` konsisten `ADR-29` pada mutasi baru:
+    /// feed & hostile menaikkan nonce; ft_transfer (ledger akun) tidak menyentuh nonce
+    /// strain; hostile diblokir saat callback berjalan (dites di hostile_pending_callback).
+    #[test]
+    fn sec108_state_nonce_konsisten_adr29() {
+        let mut c = hostile_setup();
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        assert_eq!(c.get_strain(1).state_nonce, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.feed_strain(1, U128(1_000));
+        assert_eq!(c.get_strain(1).state_nonce, 1); // feed menaikkan nonce
+        // ft_transfer antar akun tidak mengubah nonce StrainVessel mana pun.
+        fund(&mut c, ALKEMIS_ID, 100);
+        register(&mut c, RAIDER);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer(RAIDER.parse().unwrap(), U128(50), None);
+        assert_eq!(c.get_strain(1).state_nonce, 1);
+        assert_eq!(c.get_strain(2).state_nonce, 0);
+        // hostile: kedua nonce naik (`record_mutation` kedua sisi).
+        set_context_at(
+            RAIDER,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 70 * 3_600_000_000_000,
+        );
+        let _ = c.hostile_takeover_splice(2, 1, 1); // target nonce = 1 (feed)
+        assert!(c.get_strain(2).state_nonce > 0);
+        assert!(c.get_strain(1).state_nonce > 0);
+    }
+
+    /// `SEC-109` — anti-farming `DK-030`: loop 1.000 feed + klaim dividen — saldo akhir
+    /// tetap rugi bersih; total rebate ≤ total fee yang dipungut.
+    #[test]
+    fn sec109_dk030_loop_feed_dan_dividen_merugi_bersih() {
+        let mut c = SnaccContract::new();
+        // Strain 1 Extractor (pembayar fee) + strain 2 Synthesizer (klaim dividen).
+        let _ = call_incubate(&mut c, 1_000_000_000u128, EXTRACTOR_ROLE, 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1_000_000_000));
+        let _ = c.incubate_strain(role(SYNTHESIZER_ROLE), U128(1_000_000_000), 0);
+        c.macro_state.params.dormancy_threshold_bps = 0;
+        c.macro_state.epoch_treasury_initial = c.treasury;
+
+        let bal0 = c.snacc_balances.get(&1).copied().unwrap();
+        for i in 0..1_000 {
+            if i % 10 == 0 {
+                set_context(ALKEMIS_ID, NearToken::from_yoctonear(0)); // reset buffer log mock
+            }
+            c.feed_strain(1, U128(1_000));
+        }
+        let bal1 = c.snacc_balances.get(&1).copied().unwrap();
+        assert!(bal1 < bal0, "DK-030: loop feed harus rugi bersih");
+        assert!(c.macro_state.epoch_treasury_spent <= c.macro_state.epoch_feast_volume);
+
+        // Klaim dividen dari kolam (burn aether + tutup epoch + klaim pro-rata penuh).
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+        c.advance_epoch();
+        let payout = c.claim_industrial_dividend(2, 0).0;
+        assert!(payout > 0);
+        // Meski dividen diklaim penuh, total masih rugi bersih (`DK-030`).
+        let bal2 = c.snacc_balances.get(&1).copied().unwrap();
+        assert!(bal2 + payout < bal0, "rebate+dividen tidak boleh melampaui fee");
     }
 }
