@@ -133,6 +133,34 @@ pub mod constants {
     /// `F6` — kode error Cell Lysis (nama dari spec F6 & Alur POV).
     pub const ERR_STRAIN_NOT_INSOLVENT: &str = "ERR_STRAIN_NOT_INSOLVENT";
     pub const ERR_ALREADY_LIQUIDATED: &str = "ERR_ALREADY_LIQUIDATED";
+    /// `N141` — kode error: penerima `ft_transfer` belum terdaftar storage.
+    pub const ERR_ACCOUNT_NOT_REGISTERED: &str = "ERR_ACCOUNT_NOT_REGISTERED";
+    /// `N141` — kode error: `ft_transfer`/`ft_transfer_call` tanpa tepat 1 yoctoNEAR.
+    pub const ERR_YOCTO_REQUIRED: &str = "ERR_YOCTO_REQUIRED";
+    /// `DK-033/044` — kode error (nama persis dari Spec Dividend Pool §6).
+    pub const ERR_NOT_STRAIN_OWNER: &str = "ERR_NOT_STRAIN_OWNER";
+    pub const ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE: &str =
+        "ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE";
+    pub const ERR_INSUFFICIENT_AETHER: &str = "ERR_INSUFFICIENT_AETHER";
+    pub const ERR_EPOCH_NOT_CLOSED: &str = "ERR_EPOCH_NOT_CLOSED";
+    pub const ERR_DIVIDEND_ALREADY_CLAIMED: &str = "ERR_DIVIDEND_ALREADY_CLAIMED";
+    pub const ERR_DIVIDEND_CLAIM_EXPIRED: &str = "ERR_DIVIDEND_CLAIM_EXPIRED";
+    pub const ERR_DIVIDEND_POOL_EMPTY: &str = "ERR_DIVIDEND_POOL_EMPTY";
+    /// `DK-033/044` — konstanta terdokumentasi (Spec Dividend Pool §3).
+    /// `DIVIDEND_INFLOW_BPS = 5000` (50% dari fee non-burn, `ADR-28`).
+    pub const DIVIDEND_INFLOW_BPS: u128 = 5000;
+    /// `DIVIDEND_RATE_SCALE = 10^18` — hindari pembulatan merugikan pemain kecil.
+    pub const DIVIDEND_RATE_SCALE: u128 = 1_000_000_000_000_000_000;
+    /// `MAX_DIVIDEND_CLAIM_EPOCHS = 8` — batas klaim mundur, selaras `MAX_GENERATION`.
+    pub const MAX_DIVIDEND_CLAIM_EPOCHS: u64 = 8;
+    /// `MIN_AETHER_BURN = 1` — cegah spam 0-amount (keputusan tercatat: spec tidak ternominalisasi).
+    pub const MIN_AETHER_BURN: u128 = 1;
+    /// `EN-01` — `BASE_BURST_BPS = 200` (2%), selaras `REBATE_BPS` (Spec Enhancement §3.3).
+    pub const BASE_BURST_BPS: u16 = 200;
+    /// `EN-01` — `BURST_DURATION_EPOCHS = 1`.
+    pub const BURST_DURATION_EPOCHS: u64 = 1;
+    /// `N141` — deposit storage minimum MVP = 5 milliNEAR (keputusan tercatat).
+    pub const STORAGE_DEPOSIT_MILLINEAR: u128 = 5;
 }
 
 /// Helper macro: panic with a constant `ERR_*` error code.
@@ -378,6 +406,9 @@ pub struct MacroState {
     pub epoch_aether_burned_total: u128,
     /// Epoch terakhir yang ditutup (`advance_epoch`, `DK-033`).
     pub last_closed_epoch: Epoch,
+    /// `EN-104` — akumulasi diskon burst yang sudah diberikan epoch berjalan
+    /// (cap bersama kuota `I-04` = 5% Pantry/epoch; anti-boros treasury).
+    pub epoch_burst_discount_granted: u128,
     pub params: TermostatParams,
 }
 
@@ -397,6 +428,7 @@ impl Default for MacroState {
             epoch_dividend_inflow: 0,
             epoch_aether_burned_total: 0,
             last_closed_epoch: 0,
+            epoch_burst_discount_granted: 0,
             params: TermostatParams::default(),
         }
     }
@@ -419,6 +451,8 @@ pub struct MacroStateView {
     pub epoch_dividend_inflow: u128,
     pub epoch_aether_burned_total: u128,
     pub last_closed_epoch: Epoch,
+    /// `EN-104` — akumulasi diskon burst epoch berjalan (mirror `MacroState`).
+    pub epoch_burst_discount_granted: u128,
     pub params: TermostatParams,
     /// Suhu makro terhitung (`mK`, lazy decay tanpa cron — `ADR-04`).
     pub crucible_temp: u64,
@@ -460,8 +494,19 @@ impl MacroState {
             epoch_dividend_inflow: self.epoch_dividend_inflow,
             epoch_aether_burned_total: self.epoch_aether_burned_total,
             last_closed_epoch: self.last_closed_epoch,
+            epoch_burst_discount_granted: self.epoch_burst_discount_granted,
             params: self.params.clone(),
             crucible_temp: self.crucible_temp_at(now_ms),
+        }
+    }
+
+    /// Burst aktif hanya dalam `nutrient_burst_until` epoch (kedaluwarsa otomatis
+    /// saat berganti epoch, tanpa keeper — `ADR-27`, spec EN-01 §3.2).
+    pub fn active_burst_bps(&self, epoch: Epoch) -> u16 {
+        if epoch < self.nutrient_burst_until {
+            self.nutrient_burst_bps
+        } else {
+            0
         }
     }
 }

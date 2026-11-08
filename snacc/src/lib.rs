@@ -16,7 +16,7 @@ use near_sdk::serde::Deserialize;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 use state::{
-    constants, AlkemisProfile, MacroState, MacroStateView, MnaLogEntry, NftMetadataView,
+    constants, AlkemisProfile, Epoch, MacroState, MacroStateView, MnaLogEntry, NftMetadataView,
     NftTokenView, OrganelleSlots, StrainId, StrainRole, StrainStatus, StrainVessel,
     StrainVesselView, TeeAttestation, TokenId,
 };
@@ -75,8 +75,20 @@ pub struct SnaccContract {
     /// Pemilik kontrak (gerbang `register_attested_signer`) — bootstrap saat registrasi pertama.
     pub owner_id: Option<AccountId>,
     /// `F6`: bounty likuidator per **akun pemanggil** (`D6` perluasan) —
-    /// TODO(NEP-141): digabung ke ledger token global saat tersedia.
+    /// kini JUGA ledger `NEP-141` `$SNACC` per akun (`N141-101..106`):
+    /// `ft_balance_of(account)` = `account_balances` saja (keputusan tercatat).
     pub account_balances: LookupMap<AccountId, u128>,
+    /// `N141` — indeks strain per pemilik (untuk `get_total_wealth`; `LookupMap`
+    /// tidak bisa diiterasi, jadi daftar id dipelihara saat `incubate_strain`).
+    pub strains_by_owner: LookupMap<AccountId, Vector<StrainId>>,
+    /// `N141` — registry storage MVP: akun -> total milliNEAR yang didepositkan.
+    pub registered_storage: LookupMap<AccountId, u128>,
+    /// `DK-033` — `epoch_dividend_rate[epoch]` (skala `DIVIDEND_RATE_SCALE`).
+    pub epoch_dividend_rate: LookupMap<Epoch, u128>,
+    /// `DK-033` — `epoch_aether_burned[(epoch, strain_id)] -> amount`.
+    pub epoch_aether_burned: LookupMap<(Epoch, StrainId), u128>,
+    /// `DK-033` — anti double-claim `(epoch, strain_id)`.
+    pub dividend_claimed: LookupSet<(Epoch, StrainId)>,
     /// `D6` Kas `$SNACC` per Strain (neraca `vault_subaccount`).
     pub snacc_balances: LookupMap<StrainId, u128>,
     /// `D6` `Rule-Bound Treasury` — tanpa fungsi penarikan admin (`I-05`).
@@ -102,6 +114,11 @@ impl SnaccContract {
             attested_tee_signers: LookupMap::new(b"p".to_vec()),
             owner_id: None,
             account_balances: LookupMap::new(b"l".to_vec()),
+            strains_by_owner: LookupMap::new(b"o".to_vec()),
+            registered_storage: LookupMap::new(b"r".to_vec()),
+            epoch_dividend_rate: LookupMap::new(b"e".to_vec()),
+            epoch_aether_burned: LookupMap::new(b"f".to_vec()),
+            dividend_claimed: LookupSet::new(b"g".to_vec()),
             snacc_balances: LookupMap::new(b"b".to_vec()),
             treasury: 0,
             macro_state: MacroState::default(),
@@ -222,7 +239,18 @@ impl SnaccContract {
                 strain_count: 0,
             });
         profile.strain_count = profile.strain_count.saturating_add(1);
-        let _ = self.alchemists.insert(owner_id, profile);
+        let _ = self.alchemists.insert(owner_id.clone(), profile);
+
+        // `N141` — indeks strain per pemilik (untuk `get_total_wealth`);
+        // prefix `Vector` wajib unik per akun (pola nested-collection near-sdk).
+        match self.strains_by_owner.get_mut(&owner_id) {
+            Some(owned) => owned.push(strain_id),
+            None => {
+                let mut owned = Vector::new(format!("o:{}", owner_id).into_bytes());
+                owned.push(strain_id);
+                let _ = self.strains_by_owner.insert(owner_id, owned);
+            }
+        }
 
         vessel.to_view(now_sec)
     }
@@ -318,13 +346,45 @@ impl SnaccContract {
         self.macro_state.to_view(now_ms)
     }
 
-    /// `F4` — transisi epoch minimal (`VC-005`): naikkan `current_epoch`, reset
-    /// `epoch_treasury_spent`, dan snapshot `epoch_treasury_initial = self.treasury`.
-    /// TODO(DK-033): distribusi `industrial_dividend_pool` & penutupan dividen epoch penuh.
+    /// `F4` — transisi epoch (`VC-005` + `DK-033` + `EN-01`):
+    /// 1. Tutup epoch dividen: `epoch_dividend_rate[epoch] = epoch_dividend_inflow × SCALE
+    ///    / max(epoch_aether_burned_total, 1)` dihitung saat penutupan (anti-manipulasi urutan
+    ///    tx), `industrial_dividend_pool += epoch_dividend_inflow`, reset counter,
+    ///    `last_closed_epoch += 1`, emit `epoch_dividend_closed`.
+    /// 2. Reset kuota treasury `I-04` (`epoch_treasury_spent = 0`, snapshot `initial = treasury`).
+    /// 3. Reset akumulator diskon burst `EN-104`; burst kedaluwarsa otomatis via
+    ///    `active_burst_bps` (tanpa keeper — `ADR-27`).
     pub fn advance_epoch(&mut self) {
+        // --- `DK-033`: penutupan epoch dividen (V-02: waktu dari blok, bukan parameter). ---
+        let closing = self.macro_state.current_epoch;
+        let total_burned = self.macro_state.epoch_aether_burned_total;
+        let rate = self.macro_state.epoch_dividend_inflow
+            * constants::DIVIDEND_RATE_SCALE
+            / std::cmp::max(total_burned, 1);
+        let _ = self.epoch_dividend_rate.insert(closing, rate);
+        self.macro_state.industrial_dividend_pool = self
+            .macro_state
+            .industrial_dividend_pool
+            .saturating_add(self.macro_state.epoch_dividend_inflow);
+        self.macro_state.epoch_dividend_inflow = 0;
+        self.macro_state.epoch_aether_burned_total = 0;
+        self.macro_state.last_closed_epoch = self.macro_state.last_closed_epoch.saturating_add(1);
+
+        // --- `VC-005`: reset kuota `I-04`. ---
         self.macro_state.current_epoch = self.macro_state.current_epoch.saturating_add(1);
         self.macro_state.epoch_treasury_spent = 0;
         self.macro_state.epoch_treasury_initial = self.treasury;
+
+        // --- `EN-104`: reset akumulator diskon burst. ---
+        self.macro_state.epoch_burst_discount_granted = 0;
+
+        events::emit_event_json(&format!(
+            r#"{{"kind":"epoch_dividend_closed","epoch":{},"pool":{},"total_burned":{},"rate":{}}}"#,
+            closing,
+            self.macro_state.industrial_dividend_pool,
+            total_burned,
+            rate
+        ));
     }
 
     /// `F4` / `I-01` — bakar `$SNACC` dari neraca `snacc_balances[strain_id]`.
@@ -363,6 +423,19 @@ impl SnaccContract {
             v.record_mutation();
             let _ = self.strains.insert(strain_id, v);
         }
+        // `N141` — event `NEP-297` ber-standard `nep141` (`ft_burn`).
+        events::emit_standard_event(
+            "nep141",
+            "ft_burn",
+            &format!(
+                r#"{{"owner_id":"{}","amount":{}}}"#,
+                self.strains
+                    .get(&strain_id)
+                    .map(|v| v.owner_id.to_string())
+                    .unwrap_or_default(),
+                amount.0
+            ),
+        );
     }
 
     // =====================================================================
@@ -402,42 +475,68 @@ impl SnaccContract {
             "{}",
             constants::ERR_STAKE_DEPOSIT_MISMATCH
         );
+        self.apply_thermostat_fee(strain_id, fee.0);
+    }
+
+    /// Jalur termostat untuk fee internal (`feed_strain` `EN-103`): sama seperti
+    /// `take_catalyst_fee` tanpa asersi attached deposit.
+    fn apply_thermostat_fee(&mut self, strain_id: StrainId, fee: u128) {
         let now_ms = env::block_timestamp() / 1_000_000;
         let v_decayed = self.macro_state.decayed_volume(now_ms);
-        self.macro_state.volume_epoch = v_decayed.saturating_add(fee.0);
+        self.macro_state.volume_epoch = v_decayed.saturating_add(fee);
         self.macro_state.last_update_ms = now_ms;
 
         let temp = self.get_crucible_temp();
         if temp > self.macro_state.params.fever_threshold_mk {
-            let burn = fee.0 * self.macro_state.params.fever_burn_bps as u128
+            let burn = fee * self.macro_state.params.fever_burn_bps as u128
                 / constants::BPS_DENOMINATOR;
             self.macro_state.total_snacc_supply =
                 self.macro_state.total_snacc_supply.saturating_sub(burn);
             self.macro_state.total_snacc_burned =
                 self.macro_state.total_snacc_burned.saturating_add(burn);
-            let remainder = fee.0.saturating_sub(burn);
-            self.treasury = self.treasury.saturating_add(remainder);
-        } else if temp < self.macro_state.params.hypothermia_threshold_mk {
-            let raw_rebate = fee.0 * self.macro_state.params.rebate_bps as u128
-                / constants::BPS_DENOMINATOR;
-            let max_epoch_drain = self.macro_state.epoch_treasury_initial
-                * self.macro_state.params.max_epoch_treasury_drain_bps as u128
-                / constants::BPS_DENOMINATOR;
-            let remaining_quota =
-                max_epoch_drain.saturating_sub(self.macro_state.epoch_treasury_spent);
-            let rebate = raw_rebate.min(remaining_quota).min(self.treasury);
-            self.treasury = self.treasury.saturating_add(fee.0).saturating_sub(rebate);
-            if rebate > 0 {
-                let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
-                let _ = self
-                    .snacc_balances
-                    .insert(strain_id, bal.saturating_add(rebate));
-                self.macro_state.epoch_treasury_spent =
-                    self.macro_state.epoch_treasury_spent.saturating_add(rebate);
-            }
+            // `DK-033` (`ADR-28`): 50% fee non-burn ke kolam dividen, sisanya treasury.
+            self.accrue_dividend_inflow(fee, burn);
         } else {
-            self.treasury = self.treasury.saturating_add(fee.0);
+            self.accrue_dividend_inflow(fee, 0);
+            if temp < self.macro_state.params.hypothermia_threshold_mk {
+                let raw_rebate = fee * self.macro_state.params.rebate_bps as u128
+                    / constants::BPS_DENOMINATOR;
+                let max_epoch_drain = self.macro_state.epoch_treasury_initial
+                    * self.macro_state.params.max_epoch_treasury_drain_bps as u128
+                    / constants::BPS_DENOMINATOR;
+                let remaining_quota =
+                    max_epoch_drain.saturating_sub(self.macro_state.epoch_treasury_spent);
+                let rebate = raw_rebate.min(remaining_quota).min(self.treasury);
+                self.treasury = self.treasury.saturating_sub(rebate);
+                if rebate > 0 {
+                    let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+                    let _ = self
+                        .snacc_balances
+                        .insert(strain_id, bal.saturating_add(rebate));
+                    self.macro_state.epoch_treasury_spent =
+                        self.macro_state.epoch_treasury_spent.saturating_add(rebate);
+                }
+            }
         }
+    }
+
+    /// `DK-033` — `accrue_dividend_inflow(fee, burned)` (internal, Spec Dividend §4):
+    /// `inflow = (fee - burned) × DIVIDEND_INFLOW_BPS / 10000` masuk `epoch_dividend_inflow`;
+    /// sisanya (`net - inflow`) ke `Rule-Bound Treasury`. Kolam dividen terpisah dari
+    /// kuota rebate `I-04` (Spec Dividend §3).
+    fn accrue_dividend_inflow(&mut self, fee: u128, burned: u128) {
+        let net = fee.saturating_sub(burned);
+        let inflow = net * constants::DIVIDEND_INFLOW_BPS / constants::BPS_DENOMINATOR;
+        self.treasury = self.treasury.saturating_add(net - inflow);
+        self.macro_state.epoch_dividend_inflow =
+            self.macro_state.epoch_dividend_inflow.saturating_add(inflow);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"dividend_inflow","action":"catalyst_fee","fee":{},"burned":{},"inflow":{},"epoch":{}}}"#,
+            fee,
+            burned,
+            inflow,
+            self.macro_state.current_epoch
+        ));
     }
 
     /// Pemulihan metabolik (`F2`): `vitality = min(10000, effective + 500)`, `last_fed_sec = now`.
@@ -564,8 +663,9 @@ impl SnaccContract {
     }
 
     /// `F2` Tahap 3 — `synthesize_elixir` (wajib `ROLE_SYNTHESIZER`).
-    /// `mt:elixir-aether` butuh Attestation TEE (TODO: `F3`/`DK-044`) →
-    /// untuk `VC-004` ditolak `ERR_REQUIRES_TEE_ATTESTATION`.
+    /// `mt:elixir-aether` kini dapat disintesis bila strain **pernah sukses mutasi
+    /// TEE** (`phenotype_trait.is_some()` — keputusan pipeline `DK-044`, 2026-11-07);
+    /// TODO(F3): pertatkan gerbang ke attestation TEE per batch (spec belum ternominalisasi).
     /// Ambiguitas terdokumentasi: jumlah output eliksir tidak ternominalisasi →
     /// **1 eliksir per batch resep** (`enzymes_to_burn` harus kelipatan batch).
     #[payable]
@@ -585,6 +685,8 @@ impl SnaccContract {
         let eff = Self::assert_not_starving(&v, now_sec);
         Self::assert_role(&v, constants::ROLE_SYNTHESIZER);
         // Resep per batch (Katalog Molekul): (enzim_a, per_a, enzim_b, per_b, batch_total).
+        // `mt:elixir-aether`: gerbang TEE (pernah sukses mutasi), resep = keputusan tercatat
+        // (mengikuti bentuk resep homunculus: 2 amalgam + 1 synthase per batch).
         let recipe: (&str, u128, &str, u128, u128) = match elixir_type.as_str() {
             constants::ELIXIR_HOMUNCULUS => (
                 constants::ENZYME_AMALGAM,
@@ -600,7 +702,14 @@ impl SnaccContract {
                 1,
                 2,
             ),
-            constants::ELIXIR_AETHER => env::panic_str(constants::ERR_REQUIRES_TEE_ATTESTATION),
+            constants::ELIXIR_AETHER => {
+                assert!(
+                    v.phenotype_trait.is_some(),
+                    "{}",
+                    constants::ERR_REQUIRES_TEE_ATTESTATION
+                );
+                (constants::ENZYME_AMALGAM, 2, constants::ENZYME_SYNTHASE, 1, 3)
+            }
             _ => env::panic_str(constants::ERR_UNKNOWN_TOKEN),
         };
         let (enz_a, per_a, enz_b, per_b, batch_total) = recipe;
@@ -998,6 +1107,21 @@ impl SnaccContract {
             r#"{{"kind":"strain_liquidated","target_id":{},"liquidator":"{}","bounty":{},"treasury_recovery":{}}}"#,
             target_id, caller, bounty, recovery
         ));
+        // `EN-102` — `Nutrient Burst`: 90% hasil likuidasi menghidupkan diskon feed
+        // global selama 1 epoch. `scaled_share` = porsi `recovery` terhadap total
+        // suplai (`keputusan tercatat`: spec hanya menyebut "scaled_share").
+        let scaled_share =
+            recovery * constants::BPS_DENOMINATOR
+                / std::cmp::max(self.macro_state.total_snacc_supply, 1);
+        let burst_bps = (u128::from(constants::BASE_BURST_BPS) + scaled_share)
+            .min(u128::from(constants::MAX_BURST_BPS)) as u16;
+        let until_epoch = self.macro_state.current_epoch + constants::BURST_DURATION_EPOCHS;
+        self.macro_state.nutrient_burst_bps = burst_bps;
+        self.macro_state.nutrient_burst_until = until_epoch;
+        events::emit_event_json(&format!(
+            r#"{{"kind":"nutrient_burst_released","strain_id":{},"epoch":{},"released_vita":{},"burst_bps":{},"until_epoch":{}}}"#,
+            target_id, self.macro_state.current_epoch, recovery, burst_bps, until_epoch
+        ));
         (U128(bounty), U128(recovery))
     }
 }
@@ -1070,6 +1194,500 @@ impl SnaccContract {
                 ),
             },
         }
+    }
+}
+
+// =====================================================================
+// N141-101..106 — surface standar `NEP-141` untuk coin `$SNACC`
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// Bantu: saldo `NEP-141` akun (ledger `account_balances`); 0 bila tak terdaftar.
+    fn account_balance(&self, account: &AccountId) -> u128 {
+        self.account_balances.get(account).copied().unwrap_or(0)
+    }
+
+    /// `N141-102` — keputusan tercatat: `ft_balance_of` = `account_balances` SAJA
+    /// (uang di dalam Strain hanya bisa dipindah lewat mekanik game).
+    pub fn ft_balance_of(&self, account_id: AccountId) -> U128 {
+        U128(self.account_balance(&account_id))
+    }
+
+    /// `N141-102` — `ft_total_supply` = `macro_state.total_snacc_supply` (`I-01`).
+    pub fn ft_total_supply(&self) -> U128 {
+        U128(self.macro_state.total_snacc_supply)
+    }
+
+    /// `N141-102` — kekayaan total untuk display: `account_balances` + Σ saldo strain
+    /// milik akun (indeks `strains_by_owner`).
+    pub fn get_total_wealth(&self, account_id: AccountId) -> U128 {
+        let mut total = self.account_balance(&account_id);
+        if let Some(owned) = self.strains_by_owner.get(&account_id) {
+            for strain_id in owned.iter() {
+                total = total.saturating_add(
+                    self.snacc_balances.get(strain_id).copied().unwrap_or(0),
+                );
+            }
+        }
+        U128(total)
+    }
+
+    /// `N141-101` — `ft_transfer` (`#[payable]`, wajib tepat 1 yoctoNEAR).
+    /// Penerima wajib terdaftar storage (`ERR_ACCOUNT_NOT_REGISTERED`); saldo kurang
+    /// `ERR_INSUFFICIENT_BALANCE`; self-transfer netral (debit lalu kredit akun sama).
+    #[payable]
+    pub fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>) {
+        Self::assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        assert!(
+            self.registered_storage.get(&receiver_id).is_some(),
+            "{}",
+            constants::ERR_ACCOUNT_NOT_REGISTERED
+        );
+        let sender_bal = self.account_balance(&sender_id);
+        assert!(
+            sender_bal >= amount.0,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+        if sender_id != receiver_id {
+            let _ = self.account_balances.insert(sender_id.clone(), sender_bal - amount.0);
+            let recv = self.account_balance(&receiver_id);
+            let _ = self
+                .account_balances
+                .insert(receiver_id.clone(), recv.saturating_add(amount.0));
+        }
+        events::emit_standard_event(
+            "nep141",
+            "ft_transfer",
+            &format!(
+                r#"{{"old_owner_id":"{}","new_owner_id":"{}","amount":{},"memo":{}}}"#,
+                sender_id,
+                receiver_id,
+                amount.0,
+                match memo {
+                    Some(m) => format!(r#""{}""#, m),
+                    None => "null".to_string(),
+                }
+            ),
+        );
+    }
+
+    fn assert_one_yocto() {
+        assert_eq!(
+            env::attached_deposit(),
+            NearToken::from_yoctonear(1),
+            "{}",
+            constants::ERR_YOCTO_REQUIRED
+        );
+    }
+
+    /// `N141-101` — `ft_transfer_call`: transfer + promise `receiver.ft_on_transfer`
+    /// + callback `#[private] on_transfer_call` yang me-refund bagian tak terpakai.
+    #[payable]
+    pub fn ft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> Promise {
+        self.ft_transfer(receiver_id.clone(), amount, memo);
+        let sender_id = env::predecessor_account_id();
+        // Konvensi `NEP-141`: argumen `ft_on_transfer` = `{sender_id, amount, msg}`.
+        let args = near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+            "sender_id": sender_id,
+            "amount": amount.0.to_string(),
+            "msg": msg,
+        }))
+        .unwrap();
+        Promise::new(receiver_id.clone())
+            .function_call("ft_on_transfer".to_string(), args, NearToken::from_near(0),
+                near_sdk::Gas::from_tgas(20))
+            .then(Self::ext(env::current_account_id()).on_transfer_call(
+                sender_id,
+                receiver_id,
+                amount,
+            ))
+    }
+
+    /// `ADR-24` — callback anti-spoofing: refund bagian `ft_on_transfer` yang tidak
+    /// dipakai ke pengirim; bila promise gagal, refund penuh.
+    #[private]
+    pub fn on_transfer_call(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        let unused = match env::promise_result_checked(0, usize::MAX) {
+            Ok(bytes) => near_sdk::serde_json::from_slice::<U128>(&bytes)
+                .map(|u| u.0)
+                .unwrap_or(0)
+                .min(amount.0),
+            Err(_) => amount.0, // gagal `ft_on_transfer` -> refund penuh
+        };
+        if unused > 0 {
+            let bal = self.account_balance(&sender_id);
+            let _ = self
+                .account_balances
+                .insert(sender_id.clone(), bal.saturating_add(unused));
+            // Sisa dana ditarik kembali dari penerima (mengembalikan konservasi).
+            let recv_bal = self.account_balance(&receiver_id);
+            let _ = self
+                .account_balances
+                .insert(receiver_id, recv_bal.saturating_sub(unused));
+        }
+        U128(unused)
+    }
+
+    /// `N141-103` — metadata `NEP-141`. `decimals: 24` = keputusan tercatat.
+    pub fn ft_metadata(&self) -> FungibleTokenMetadata {
+        let logo = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#1b0f2e\"/><text x=\"32\" y=\"43\" font-family=\"monospace\" font-size=\"30\" fill=\"#ff8a3d\" text-anchor=\"middle\">S</text></svg>";
+        FungibleTokenMetadata {
+            spec: "ft-1.0.0".to_string(),
+            name: "Snacc".to_string(),
+            symbol: "$SNACC".to_string(),
+            decimals: 24,
+            icon: Some(format!(
+                "data:image/svg+xml;base64,{}",
+                svg::base64_encode(logo.as_bytes())
+            )),
+            reference: None,
+            reference_hash: None,
+        }
+    }
+
+    /// `N141-104` — `storage_deposit` MVP: registry akun -> total deposit (milliNEAR).
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) -> StorageBalance {
+        let target = account_id.unwrap_or_else(env::predecessor_account_id);
+        let attached = env::attached_deposit().as_yoctonear();
+        let min_yocto =
+            NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR).as_yoctonear();
+        let existing = self.registered_storage.get(&target).copied().unwrap_or(0);
+        if existing == 0 {
+            // Minimum 5 milliNEAR hanya untuk registrasi pertama (keputusan tercatat).
+            assert!(
+                attached >= min_yocto,
+                "{}",
+                constants::ERR_INSUFFICIENT_DEPOSIT
+            );
+        }
+        let total = existing.saturating_add(attached);
+        let _ = self.registered_storage.insert(target.clone(), total);
+        StorageBalance {
+            total: U128(total),
+            available: U128(total),
+        }
+    }
+
+    /// `N141-104` — `storage_withdraw`: tarik deposit berlebih. Saldo minimum
+    /// (`STORAGE_DEPOSIT_MILLINEAR`) tetap terkunci selama akun memegang `$SNACC > 0`
+    /// (keputusan tercatat, MVP).
+    #[payable]
+    pub fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        let caller = env::predecessor_account_id();
+        let total = self
+            .registered_storage
+            .get(&caller)
+            .copied()
+            .unwrap_or(0);
+        assert!(total > 0, "{}", constants::ERR_ACCOUNT_NOT_REGISTERED);
+        let locked = if self.account_balance(&caller) > 0 {
+            NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR).as_yoctonear()
+        } else {
+            0
+        };
+        let available = total.saturating_sub(locked);
+        let withdraw = match amount {
+            Some(a) => {
+                assert!(
+                    a.0 <= available,
+                    "{}",
+                    constants::ERR_INSUFFICIENT_BALANCE
+                );
+                a.0
+            }
+            None => available,
+        };
+        if withdraw > 0 {
+            let new_total = total - withdraw;
+            if new_total == 0 {
+                // Menarik penuh = batal registrasi (tak bisa menerima transfer lagi).
+                let _ = self.registered_storage.remove(&caller);
+            } else {
+                let _ = self.registered_storage.insert(caller.clone(), new_total);
+            }
+            let _ = Promise::new(caller).transfer(NearToken::from_yoctonear(withdraw));
+        }
+        let new_total = total - withdraw;
+        StorageBalance {
+            total: U128(new_total),
+            available: U128(new_total.saturating_sub(locked)),
+        }
+    }
+
+    /// `N141-104` — `storage_balance_of`.
+    pub fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        self.registered_storage
+            .get(&account_id)
+            .copied()
+            .map(|total| StorageBalance {
+                total: U128(total),
+                available: U128(total),
+            })
+    }
+}
+
+/// Metadata `NEP-141` (`N141-103`) — subset standar + ikon SVG inline.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FungibleTokenMetadata {
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
+    pub icon: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<String>,
+}
+
+/// `N141-104` — saldo storage MVP.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageBalance {
+    pub total: U128,
+    pub available: U128,
+}
+
+// =====================================================================
+// DK-033 / DK-044 — Industrial Dividend Pool (`ADR-28`)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `DK-044` — bakar `mt:elixir-aether` sebagai kontribusi dividen epoch berjalan
+    /// (Fase 1 pro-rata; belum membayar sampai epoch ditutup).
+    pub fn synthesize_and_redeem_aether(&mut self, strain_id: StrainId, amount: U128) {
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        // `V-01` — hanya pemilik.
+        assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_STRAIN_OWNER);
+        // Gerbang kasta: butuh bit `ROLE_SYNTHESIZER`.
+        assert!(
+            v.role_mask & constants::ROLE_SYNTHESIZER != 0,
+            "{}",
+            constants::ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE
+        );
+        assert!(
+            amount.0 >= constants::MIN_AETHER_BURN,
+            "{}",
+            constants::ERR_INSUFFICIENT_AETHER
+        );
+        // Stok `mt:elixir-aether` cukup.
+        let stock = self.inv_balance(strain_id, constants::ELIXIR_AETHER);
+        assert!(
+            stock >= amount.0,
+            "{}",
+            constants::ERR_INSUFFICIENT_AETHER
+        );
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        // `effective_vitality > 0` (`ERR_STRAIN_STARVING`).
+        let _ = Self::assert_not_starving(&v, now_sec);
+
+        self.inv_burn(strain_id, constants::ELIXIR_AETHER, amount.0);
+        let epoch = self.macro_state.current_epoch;
+        let key = (epoch, strain_id);
+        let prev = self.epoch_aether_burned.get(&key).copied().unwrap_or(0);
+        let _ = self.epoch_aether_burned.insert(key, prev.saturating_add(amount.0));
+        self.macro_state.epoch_aether_burned_total = self
+            .macro_state
+            .epoch_aether_burned_total
+            .saturating_add(amount.0);
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"aether_burned_for_dividend","strain_id":{},"amount":{},"epoch":{},"cumulative":{}}}"#,
+            strain_id,
+            amount.0,
+            epoch,
+            self.macro_state.epoch_aether_burned_total
+        ));
+    }
+
+    /// `DK-033` Fase 2 — klaim dividen pro-rata untuk `(strain_id, epoch)` yang sudah
+    /// ditutup: `payout = kontribusi × epoch_dividend_rate[epoch] / DIVIDEND_RATE_SCALE`,
+    /// dipotong ke saldo kolam (tidak pernah mint — `DK-010`), sekali per `(epoch, strain)`.
+    pub fn claim_industrial_dividend(&mut self, strain_id: StrainId, epoch: Epoch) -> U128 {
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_STRAIN_OWNER);
+        // Epoch wajib sudah ditutup.
+        assert!(
+            epoch < self.macro_state.last_closed_epoch,
+            "{}",
+            constants::ERR_EPOCH_NOT_CLOSED
+        );
+        // Batas klaim mundur `MAX_DIVIDEND_CLAIM_EPOCHS`.
+        assert!(
+            epoch
+                >= self
+                    .macro_state
+                    .current_epoch
+                    .saturating_sub(constants::MAX_DIVIDEND_CLAIM_EPOCHS),
+            "{}",
+            constants::ERR_DIVIDEND_CLAIM_EXPIRED
+        );
+        let claim_key = (epoch, strain_id);
+        assert!(
+            !self.dividend_claimed.contains(&claim_key),
+            "{}",
+            constants::ERR_DIVIDEND_ALREADY_CLAIMED
+        );
+        let contribution = self.epoch_aether_burned.get(&claim_key).copied().unwrap_or(0);
+        let rate = self.epoch_dividend_rate.get(&epoch).copied().unwrap_or(0);
+        let mut payout = contribution
+            .saturating_mul(rate)
+            / constants::DIVIDEND_RATE_SCALE;
+        // Cap: payout ≤ saldo kolam (menutup `V-04`); kolam kosong -> error eksplisit.
+        if payout > self.macro_state.industrial_dividend_pool {
+            payout = self.macro_state.industrial_dividend_pool;
+        }
+        assert!(
+            payout > 0,
+            "{}",
+            constants::ERR_DIVIDEND_POOL_EMPTY
+        );
+        self.macro_state.industrial_dividend_pool = self
+            .macro_state
+            .industrial_dividend_pool
+            .saturating_sub(payout);
+        let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        let _ = self.snacc_balances.insert(strain_id, bal.saturating_add(payout));
+        let _ = self.dividend_claimed.insert(claim_key);
+        // `ADR-29` — setiap mutasi saldo menaikkan nonce.
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"dividend_claimed","strain_id":{},"epoch":{},"contribution":{},"payout":{},"pool_after":{}}}"#,
+            strain_id,
+            epoch,
+            contribution,
+            payout,
+            self.macro_state.industrial_dividend_pool
+        ));
+        U128(payout)
+    }
+
+    /// `DK-033` — view kolam: `(industrial_dividend_pool, epoch_dividend_inflow, last_closed_epoch)`.
+    pub fn get_dividend_pool(&self) -> (U128, U128, Epoch) {
+        (
+            U128(self.macro_state.industrial_dividend_pool),
+            U128(self.macro_state.epoch_dividend_inflow),
+            self.macro_state.last_closed_epoch,
+        )
+    }
+
+    /// `DK-033` — rate epoch (skala `DIVIDEND_RATE_SCALE`); 0 bila belum ditutup.
+    pub fn get_epoch_dividend_rate(&self, epoch: Epoch) -> U128 {
+        U128(self.epoch_dividend_rate.get(&epoch).copied().unwrap_or(0))
+    }
+
+    /// `DK-033` — kontribusi `(epoch, strain)` + status klaim.
+    pub fn get_dividend_contribution(&self, epoch: Epoch, strain_id: StrainId) -> (U128, bool) {
+        (
+            U128(self
+                .epoch_aether_burned
+                .get(&(epoch, strain_id))
+                .copied()
+                .unwrap_or(0)),
+            self.dividend_claimed.contains(&(epoch, strain_id)),
+        )
+    }
+}
+
+// =====================================================================
+// EN-101..104 — Nutrient Burst (spec Enhancement §3)
+// =====================================================================
+#[near]
+impl SnaccContract {
+    /// `EN-101` — view state burst: `(nutrient_burst_bps_aktif, nutrient_burst_until)`.
+    /// `bps` yang dikembalikan adalah nilai EFEKTIF untuk epoch berjalan (0 bila
+    /// kedaluwarsa — tanpa keeper, `ADR-27`).
+    pub fn get_burst_state(&self) -> (U128, Epoch) {
+        let epoch = self.macro_state.current_epoch;
+        (
+            U128(u128::from(self.macro_state.active_burst_bps(epoch))),
+            self.macro_state.nutrient_burst_until,
+        )
+    }
+
+    /// `EN-103` — `feed_strain(strain_id, amount)`: bakar `$SNACC` dari saldo strain
+    /// sendiri sebagai makanan. Keputusan tercatat (spec tidak ternominalisasi):
+    /// `base_fee = amount`; porsi yang BENAR-BENAR keluar dari saldo strain adalah
+    /// `effective_fee = base_fee × (10000 − burst) / 10000` saat burst aktif, lalu
+    /// masuk jalur termostat `F4` (volume, Fever burn, rebate `I-04`, split dividen
+    /// `DK-033`); sisa diskon tetap di saldo strain (di sinilah "feed lebih murah").
+    /// Pemulihan metabolik `+500` & `last_fed_sec = now` (pola `F2`).
+    pub fn feed_strain(&mut self, strain_id: StrainId, amount: U128) -> StrainVesselView {
+        let caller = env::predecessor_account_id();
+        let mut v = self
+            .strains
+            .get(&strain_id)
+            .expect(constants::ERR_STRAIN_NOT_FOUND)
+            .clone();
+        assert_eq!(caller, v.owner_id, "{}", constants::ERR_NOT_OWNED_BY_CALLEE);
+        assert!(amount.0 > 0, "{}", constants::ERR_INSUFFICIENT_BALANCE);
+        let now_sec = env::block_timestamp() / 1_000_000_000;
+        let eff = Self::assert_not_starving(&v, now_sec);
+        let bal = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
+        assert!(
+            bal >= amount.0,
+            "{}",
+            constants::ERR_INSUFFICIENT_BALANCE
+        );
+
+        // `EN-103` — diskon burst, dengan cap `EN-104` (5% Pantry/epoch, kuota `I-04`).
+        let base_fee = amount.0;
+        let burst_bps = self.macro_state.active_burst_bps(self.macro_state.current_epoch);
+        let raw_discount = base_fee - base_fee * u128::from(10000 - burst_bps)
+            / constants::BPS_DENOMINATOR;
+        let max_epoch_drain = self.macro_state.epoch_treasury_initial
+            * self.macro_state.params.max_epoch_treasury_drain_bps as u128
+            / constants::BPS_DENOMINATOR;
+        let remaining_quota = max_epoch_drain
+            .saturating_sub(self.macro_state.epoch_treasury_spent)
+            .saturating_sub(self.macro_state.epoch_burst_discount_granted);
+        let discount = raw_discount.min(remaining_quota);
+        self.macro_state.epoch_burst_discount_granted = self
+            .macro_state
+            .epoch_burst_discount_granted
+            .saturating_add(discount);
+        let effective_fee = base_fee - discount;
+
+        // Debit `effective_fee` dari saldo strain -> jalur termostat `F4`.
+        let _ = self
+            .snacc_balances
+            .insert(strain_id, bal - effective_fee);
+        self.apply_thermostat_fee(strain_id, effective_fee);
+
+        // Pemulihan metabolik (pola `F2`) + nonce.
+        Self::recover_metabolism(&mut v, eff, now_sec);
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        events::emit_event_json(&format!(
+            r#"{{"kind":"fed","strain_id":{},"base_fee":{},"effective_fee":{},"burst_bps":{}}}"#,
+            strain_id, base_fee, effective_fee, burst_bps
+        ));
+        self.get_strain(strain_id)
     }
 }
 
@@ -1346,8 +1964,11 @@ mod tests {
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         let _ = c.extract_spores(1, "mt:spore-cryo".to_string(), U128(0));
         assert_eq!(c.inventories.get(&(1, "mt:spore-cryo".to_string())), Some(&1));
-        // baseline treasury = 20% stake inkubasi (2e11) + katalis 7.
-        assert_eq!(c.treasury, 200_000_000_000 + 7);
+        // baseline treasury = 20% stake inkubasi (2e11) + katalis 7: fee 7 masuk zona
+        // Hypothermia (temp=0); inflow DK-033 = 7×5000/10000 = 3, treasury = 7−3 = 4;
+        // rebate 7×200/10000 = 0.
+        assert_eq!(c.treasury, 200_000_000_000 + 4);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 3);
     }
 
     #[test]
@@ -1521,7 +2142,9 @@ mod tests {
             c.macro_state.total_snacc_supply + c.macro_state.total_snacc_burned,
             supply_before
         );
-        assert_eq!(c.treasury, treasury_before + (fee - expected_burn));
+        // `DK-033`: sisa non-burn 19_300 dibagi 50/50 — inflow 9_650, treasury 9_650.
+        assert_eq!(c.treasury, treasury_before + 9_650);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 9_650);
     }
 
     /// (3) Hypothermia (`temp < 600`): rebate 200 bps dari treasury ke `snacc_balances[strain_id]`.
@@ -1546,8 +2169,10 @@ mod tests {
             c.snacc_balances.get(&1).copied().unwrap(),
             bal_before + expected_rebate
         );
-        // Sisa fee masuk treasury (+10_000), rebate keluar dari treasury (-200).
-        assert_eq!(c.treasury, treasury_before + fee - expected_rebate);
+        // `DK-033`: fee 10_000 dibagi 50/50 (inflow 5_000, treasury +5_000), lalu
+        // rebate 200 keluar dari treasury.
+        assert_eq!(c.treasury, treasury_before + fee - expected_rebate - 5_000);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 5_000);
         assert_eq!(c.macro_state.epoch_treasury_spent, expected_rebate);
     }
 
@@ -1576,7 +2201,8 @@ mod tests {
         let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
         assert_eq!(c.macro_state.epoch_treasury_spent, 10_000);
         assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), bal_after_cap);
-        assert_eq!(c.treasury, treasury_after_cap + 10_000);
+        // `DK-033`: fee 10_000 dibagi 50/50 — treasury hanya +5_000 (rebate 0, kuota habis).
+        assert_eq!(c.treasury, treasury_after_cap + 5_000);
     }
 
     /// (4) `advance_epoch` mereset kuota `epoch_treasury_spent` dan menyalin `epoch_treasury_initial`.
@@ -1613,7 +2239,9 @@ mod tests {
         assert_eq!(c.macro_state.total_snacc_burned, 0);
         assert_eq!(c.macro_state.epoch_treasury_spent, 0);
         assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
-        assert_eq!(c.treasury, 8_000);
+        // `DK-033`: fee 6_000 dibagi 50/50 — treasury 2_000+3_000, inflow 3_000.
+        assert_eq!(c.treasury, 5_000);
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 3_000);
 
         // Batas atas zona tengah: tambah fee = 8_000 -> volume_epoch = 14_000 -> temp = 1400 mK
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(8_000));
@@ -1622,7 +2250,8 @@ mod tests {
         assert_eq!(c.macro_state.total_snacc_burned, 0);
         assert_eq!(c.macro_state.epoch_treasury_spent, 0);
         assert_eq!(c.snacc_balances.get(&1).copied().unwrap(), 8_000);
-        assert_eq!(c.treasury, 16_000);
+        assert_eq!(c.treasury, 9_000); // +4_000 (50% dari 8_000)
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 7_000); // 3_000+4_000
     }
 
     /// (2) `get_macro_state` konsisten dengan `get_crucible_temp` & serialisasi JSON/Borsh.
@@ -2040,5 +2669,607 @@ mod tests {
         let _ = c.harvest_starving_strain(1); // -> strain_liquidated
         let l3 = near_sdk::test_utils::get_logs().join("\n");
         assert!(l3.contains(r#""event":"strain_liquidated""#), "strain_liquidated hilang");
+    }
+
+    // ------------------------------------------------------------------
+    // N141-101..106 — surface standar NEP-141 ($SNACC)
+    // ------------------------------------------------------------------
+
+    const ALICE: &str = "alice.testnet";
+    const BOB: &str = "bob.testnet";
+
+    /// Daftarkan akun (storage deposit MVP 5 milliNEAR).
+    fn register(c: &mut SnaccContract, account: &str) {
+        set_context(account, NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR));
+        let _ = c.storage_deposit(None);
+    }
+
+    fn fund(c: &mut SnaccContract, account: &str, amount: u128) {
+        let _ = c
+            .account_balances
+            .insert(account.parse::<AccountId>().unwrap(), amount);
+    }
+
+    fn n141_setup() -> (SnaccContract, u128) {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // strain bal 8_000
+        register(&mut c, ALKEMIS_ID);
+        register(&mut c, ALICE);
+        register(&mut c, BOB);
+        let supply = c.macro_state.total_snacc_supply;
+        (c, supply)
+    }
+
+    /// (1) transfer sukses + event `NEP-297` ber-standard `nep141`.
+    #[test]
+    fn n141_ft_transfer_sukses_dan_event() {
+        let (mut c, supply) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer(ALICE.parse().unwrap(), U128(400), Some("lab fee".to_string()));
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 600);
+        assert_eq!(c.account_balance(&ALICE.parse().unwrap()), 400);
+        // Transfer tidak mengubah suplai (`I-01`).
+        assert_eq!(c.macro_state.total_snacc_supply, supply);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""standard":"nep141""#), "standard nep141 hilang");
+        assert!(logs.contains(r#""event":"ft_transfer""#), "event ft_transfer hilang");
+        assert!(logs.contains(r#""old_owner_id":"alkemis.testnet""#));
+        assert!(logs.contains(r#""new_owner_id":"alice.testnet""#));
+    }
+
+    /// (2) penerima tak terdaftar -> `ERR_ACCOUNT_NOT_REGISTERED`.
+    #[test]
+    #[should_panic(expected = "ERR_ACCOUNT_NOT_REGISTERED")]
+    fn n141_transfer_ke_tak_terdaftar_ditolak() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer("raider.testnet".parse().unwrap(), U128(100), None);
+    }
+
+    /// (3) saldo kurang -> `ERR_INSUFFICIENT_BALANCE`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn n141_saldo_kurang_ditolak() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 100);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer(ALICE.parse().unwrap(), U128(400), None);
+    }
+
+    /// (4) tanpa 1 yoctoNEAR -> `ERR_YOCTO_REQUIRED` (keputusan tercatat: spec tidak menamai).
+    #[test]
+    #[should_panic(expected = "ERR_YOCTO_REQUIRED")]
+    fn n141_tanpa_satu_yocto_ditolak() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.ft_transfer(ALICE.parse().unwrap(), U128(100), None);
+    }
+
+    /// (5) self-transfer netral: saldo & total supply tidak berubah.
+    #[test]
+    fn n141_self_transfer_netral() {
+        let (mut c, supply) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        c.ft_transfer(ALKEMIS_ID.parse().unwrap(), U128(400), None);
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 1_000);
+        assert_eq!(c.macro_state.total_snacc_supply, supply);
+    }
+
+    /// (6a) `ft_transfer_call`: jalur callback gagal -> refund penuh ke pengirim.
+    #[test]
+    fn n141_transfer_call_refund_penuh_saat_gagal() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        let _ = c.ft_transfer_call(ALICE.parse().unwrap(), U128(400), None, "x".to_string());
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 600);
+        assert_eq!(c.account_balance(&ALICE.parse().unwrap()), 400);
+
+        // Simulasikan callback dengan promise gagal (`ft_on_transfer` tidak merespons).
+        let mut builder = VMContextBuilder::new();
+        builder
+            .predecessor_account_id("snacc-v001.near".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(3_600_000_000_000);
+        testing_env!(
+            builder.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed]
+        );
+        let refunded = c.on_transfer_call(
+            ALKEMIS_ID.parse().unwrap(),
+            ALICE.parse().unwrap(),
+            U128(400),
+        );
+        assert_eq!(refunded.0, 400);
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 1_000);
+        assert_eq!(c.account_balance(&ALICE.parse().unwrap()), 0);
+    }
+
+    /// (6b) `ft_transfer_call`: `ft_on_transfer` sukses pakai sebagian -> refund sisanya.
+    #[test]
+    fn n141_transfer_call_refund_unused() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 1_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(1));
+        let _ = c.ft_transfer_call(ALICE.parse().unwrap(), U128(400), None, "x".to_string());
+
+        let mut builder = VMContextBuilder::new();
+        builder
+            .predecessor_account_id("snacc-v001.near".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(3_600_000_000_000);
+        testing_env!(
+            builder.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Successful(
+                near_sdk::serde_json::to_vec(&U128(150)).unwrap()
+            )]
+        );
+        let refunded = c.on_transfer_call(
+            ALKEMIS_ID.parse().unwrap(),
+            ALICE.parse().unwrap(),
+            U128(400),
+        );
+        assert_eq!(refunded.0, 150);
+        assert_eq!(c.account_balance(&ALKEMIS_ID.parse().unwrap()), 750);
+        assert_eq!(c.account_balance(&ALICE.parse().unwrap()), 250);
+    }
+
+    /// (7) `ft_metadata` benar (decimals 24 = keputusan tercatat).
+    #[test]
+    fn n141_ft_metadata_benar() {
+        let c = SnaccContract::new();
+        let m = c.ft_metadata();
+        assert_eq!(m.spec, "ft-1.0.0");
+        assert_eq!(m.name, "Snacc");
+        assert_eq!(m.symbol, "$SNACC");
+        assert_eq!(m.decimals, 24);
+        assert!(m.icon.unwrap().starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(m.reference, None);
+        assert_eq!(m.reference_hash, None);
+    }
+
+    /// (8) `ft_total_supply` konsisten `I-01` (bertambah saat inkubasi, turun saat burn).
+    #[test]
+    fn n141_ft_total_supply_konsisten_i01() {
+        let (mut c, _) = n141_setup();
+        assert_eq!(c.ft_total_supply().0, 10_000);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.ft_burn(1, U128(3_000));
+        assert_eq!(c.ft_total_supply().0, 7_000);
+    }
+
+    /// (9) storage deposit / withdraw / balance_of (MVP).
+    #[test]
+    fn n141_storage_siklus_lengkap() {
+        let mut c = SnaccContract::new();
+        register(&mut c, ALICE);
+        let alice: AccountId = ALICE.parse().unwrap();
+        let bal = c.storage_balance_of(alice.clone()).unwrap();
+        assert_eq!(bal.total.0, NearToken::from_millinear(5).as_yoctonear());
+
+        // Tambatkan deposit lagi -> total bertambah.
+        set_context(ALICE, NearToken::from_millinear(3));
+        let bal2 = c.storage_deposit(Some(alice.clone()));
+        assert_eq!(bal2.total.0, NearToken::from_millinear(8).as_yoctonear());
+
+        // Belum memegang $SNACC -> bisa tarik penuh; entri terhapus (batal registrasi).
+        set_context(ALICE, NearToken::from_yoctonear(0));
+        let bal3 = c.storage_withdraw(None);
+        assert_eq!(bal3.total.0, 0);
+        assert_eq!(c.storage_balance_of(alice.clone()), None);
+
+        // Memegang $SNACC -> minimum 5 milliNEAR terkunci.
+        register(&mut c, ALICE);
+        fund(&mut c, ALICE, 500);
+        set_context(ALICE, NearToken::from_yoctonear(0));
+        let bal4 = c.storage_withdraw(None);
+        assert_eq!(bal4.total.0, NearToken::from_millinear(5).as_yoctonear());
+        assert_eq!(bal4.available.0, 0);
+        assert!(c.storage_balance_of(alice).is_some());
+    }
+
+    /// (10) `get_total_wealth` = account_balances + Σ saldo strain miliknya.
+    #[test]
+    fn n141_get_total_wealth() {
+        let (mut c, _) = n141_setup();
+        fund(&mut c, ALKEMIS_ID, 100); // strain 1 milik ALKEMIS, saldo 8_000
+        assert_eq!(c.get_total_wealth(ALKEMIS_ID.parse().unwrap()).0, 8_100);
+        assert_eq!(c.ft_balance_of(ALKEMIS_ID.parse().unwrap()).0, 100);
+        assert_eq!(c.ft_balance_of(ALICE.parse().unwrap()).0, 0);
+    }
+
+    /// (11) deposit storage di bawah minimum -> `ERR_INSUFFICIENT_DEPOSIT`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_DEPOSIT")]
+    fn n141_storage_deposit_kurang_ditolak() {
+        let mut c = SnaccContract::new();
+        set_context(ALICE, NearToken::from_millinear(4));
+        let _ = c.storage_deposit(None);
+    }
+
+    // ------------------------------------------------------------------
+    // DK-033 / DK-044 — Industrial Dividend Pool (ADR-28)
+    // ------------------------------------------------------------------
+
+    /// Setup dividen: strain 1 = Extractor (pembayar fee katalis), strain 2 =
+    /// Synthesizer (kontributor/klaim dividen). Supply 20_000, treasury 4_000.
+    fn dk_setup() -> SnaccContract {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, SYNTHESIZER_ROLE, 0);
+        c
+    }
+
+    /// Skema dasar: fee katalis → inflow; bakar aether → kontribusi; tutup epoch →
+    /// rate; klaim pro-rata tepat.
+    #[test]
+    fn dk033_skema_dividen_dasar_pro_rata() {
+        let mut c = dk_setup();
+        // Epoch 0: fee 10_000 (temp = 1000, zona netral) -> inflow 5_000.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        assert_eq!(c.macro_state.epoch_dividend_inflow, 5_000);
+
+        // Bakar 2 aether sebagai kontribusi (strain 2 = Synthesizer).
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 5);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(2));
+        assert_eq!(c.macro_state.epoch_aether_burned_total, 2);
+        assert_eq!(c.inventories.get(&(2, constants::ELIXIR_AETHER.to_string())), Some(&3));
+
+        // Tutup epoch: rate = 5_000 × 1e18 / 2 = 2_500 × 1e18; pool = 5_000.
+        c.advance_epoch();
+        assert_eq!(c.get_epoch_dividend_rate(0).0, 2_500_000_000_000_000_000_000); // 2_500 × 1e18
+        assert_eq!(c.get_dividend_pool(), (U128(5_000), U128(0), 1));
+
+        // Klaim: payout = 2 × 2_500e18 / 1e18 = 5_000 (pro-rata penuh, satu-satunya kontributor).
+        let bal_before = c.snacc_balances.get(&2).copied().unwrap();
+        let payout = c.claim_industrial_dividend(2, 0);
+        assert_eq!(payout.0, 5_000);
+        assert_eq!(c.snacc_balances.get(&2).copied().unwrap(), bal_before + 5_000);
+        assert_eq!(c.get_dividend_pool().0 .0, 0);
+        let (contrib, claimed) = c.get_dividend_contribution(0, 2);
+        assert_eq!(contrib.0, 2);
+        assert!(claimed);
+        // `TC-DIV-10`: nonce naik saat payout (`ADR-29`).
+        assert!(c.get_strain(2).state_nonce > 0);
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"dividend_claimed""#));
+    }
+
+    /// `TC-DIV-03` — klaim ganda ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_DIVIDEND_ALREADY_CLAIMED")]
+    fn dk033_klaim_ganda_ditolak() {
+        let mut c = dk_setup();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+        c.advance_epoch();
+        let _ = c.claim_industrial_dividend(2, 0);
+        let _ = c.claim_industrial_dividend(2, 0);
+    }
+
+    /// `TC-DIV-04` — klaim epoch berjalan -> `ERR_EPOCH_NOT_CLOSED`.
+    #[test]
+    #[should_panic(expected = "ERR_EPOCH_NOT_CLOSED")]
+    fn dk033_klaim_epoch_berjalan_ditolak() {
+        let mut c = dk_setup();
+        let _ = c.claim_industrial_dividend(1, 0);
+    }
+
+    /// Batas klaim mundur `MAX_DIVIDEND_CLAIM_EPOCHS = 8` -> `ERR_DIVIDEND_CLAIM_EXPIRED`.
+    #[test]
+    #[should_panic(expected = "ERR_DIVIDEND_CLAIM_EXPIRED")]
+    fn dk033_klaim_kedaluwarsa_ditolak() {
+        let mut c = dk_setup();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+        // Tutup 10 epoch (inflow kosong di epoch 1..10).
+        for _ in 0..10 {
+            set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+            c.advance_epoch();
+        }
+        let _ = c.claim_industrial_dividend(2, 0);
+    }
+
+    /// `TC-DIV-05` — payout di-cap ke saldo kolam; tidak pernah mint/negatif.
+    #[test]
+    fn dk033_cap_pool_dan_konservasi() {
+        let mut c = dk_setup(); // strain 1 Extractor, strain 2 Synthesizer
+        // Fee 10_000 dari strain 1 -> inflow 5_000.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        // Strain ketiga = Synthesizer tambahan.
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(SYNTHESIZER_ROLE), U128(0), 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        // strain 2 & 3 bakar 1 & 3 aether (total 4).
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 1);
+        let _ = c.inventories.insert((3, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+        c.synthesize_and_redeem_aether(3, U128(3));
+        c.advance_epoch();
+        // rate = 10_000 × 1e18 / 4 = 2_500e18.
+        let pool = c.get_dividend_pool().0 .0;
+        assert_eq!(pool, 10_000); // inflow 5_000 + 5_000
+        let p2 = c.claim_industrial_dividend(2, 0).0;
+        let p3 = c.claim_industrial_dividend(3, 0).0;
+        assert_eq!(p2, 2_500); // 1 × 2_500e18 / 1e18
+        assert_eq!(p3, 7_500); // 3 × 2_500e18 / 1e18
+        // `TC-DIV-05`: Σ payout ≤ pool; kolam habis tepat.
+        assert!(p2 + p3 <= pool);
+        assert_eq!(c.get_dividend_pool().0 .0, 0);
+    }
+
+    /// Kolam kosong (rate 0) -> `ERR_DIVIDEND_POOL_EMPTY`.
+    #[test]
+    #[should_panic(expected = "ERR_DIVIDEND_POOL_EMPTY")]
+    fn dk033_kolam_kosong_ditolak() {
+        let mut c = dk_setup();
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+        c.advance_epoch(); // tanpa fee -> inflow 0 -> rate 0 -> payout 0
+        let _ = c.claim_industrial_dividend(2, 0);
+    }
+
+    /// `TC-DIV-06` — tanpa bit `ROLE_SYNTHESIZER` -> `ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE`.
+    #[test]
+    #[should_panic(expected = "ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE")]
+    fn dk044_role_bukan_synthesizer_ditolak() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = c.inventories.insert((1, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(1, U128(1));
+    }
+
+    /// `TC-DIV-07` — akun lain bakar aether strain orang lain -> `ERR_NOT_STRAIN_OWNER`.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_STRAIN_OWNER")]
+    fn dk044_non_owner_ditolak() {
+        let mut c = dk_setup();
+        let _ = c.inventories.insert((1, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context("raider.testnet", NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(1, U128(1));
+    }
+
+    /// Stok aether kurang / amount 0 (< `MIN_AETHER_BURN`) -> `ERR_INSUFFICIENT_AETHER`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_AETHER")]
+    fn dk044_aether_kurang_ditolak() {
+        let mut c = dk_setup();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(2, U128(1));
+    }
+
+    /// Strain kelaparan (effective_vitality == 0) -> `ERR_STRAIN_STARVING`.
+    #[test]
+    #[should_panic(expected = "ERR_STRAIN_STARVING")]
+    fn dk044_strain_kelaparan_ditolak() {
+        let mut c = dk_setup();
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        set_context_at(
+            ALKEMIS_ID,
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        c.synthesize_and_redeem_aether(2, U128(1));
+    }
+
+    /// `TC-DIV-02` — anti first-mover: dua strain, urutan klaim dibalik, payout total
+    /// identik (rate dikunci saat `advance_epoch`).
+    #[test]
+    fn dk033_anti_first_mover() {
+        let mut c = dk_setup(); // strain 1 Extractor, strain 2 Synthesizer
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.incubate_strain(role(SYNTHESIZER_ROLE), U128(0), 0);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(10_000));
+        let _ = c.extract_spores(1, "mt:spore-ignis".to_string(), U128(10_000));
+        let _ = c.inventories.insert((2, constants::ELIXIR_AETHER.to_string()), 3);
+        let _ = c.inventories.insert((3, constants::ELIXIR_AETHER.to_string()), 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.synthesize_and_redeem_aether(3, U128(1)); // strain 3 (kontribusi kecil) lebih dulu
+        c.synthesize_and_redeem_aether(2, U128(3));
+        c.advance_epoch();
+        let p3 = c.claim_industrial_dividend(3, 0).0; // urutan klaim dibalik
+        let p2 = c.claim_industrial_dividend(2, 0).0;
+        // inflow 10_000; kontribusi 3:1 -> payout 7_500 : 2_500 (pro-rata, bukan first-mover).
+        assert_eq!(p3, 2_500);
+        assert_eq!(p2, 7_500);
+        assert_eq!(p2 + p3, 10_000);
+    }
+
+    // ------------------------------------------------------------------
+    // EN-101..104 — Nutrient Burst (spec Enhancement §3)
+    // ------------------------------------------------------------------
+
+    /// `EN-101` — getter `get_burst_state` (0 sebelum ada likuidasi).
+    #[test]
+    fn en101_get_burst_state_awal_nol() {
+        let c = dk_setup();
+        assert_eq!(c.get_burst_state(), (U128(0), 0));
+    }
+
+    /// `EN-102` — `harvest_starving_strain` menyalakan burst: `min(BASE + scaled, MAX)`,
+    /// `until = epoch + 1`, event `nutrient_burst_released`.
+    #[test]
+    fn en102_harvest_menyalakan_burst() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0); // saldo 8_000, supply 10_000
+        let _ = c.inventories.insert((1, "mt:spore-ignis".to_string()), 5);
+        set_context_at(
+            "raider.testnet",
+            NearToken::from_yoctonear(0),
+            3_600_000_000_000 + 200 * 3_600_000_000_000,
+        );
+        let (_bounty, recovery) = c.harvest_starving_strain(1);
+        assert_eq!(recovery.0, 7_200);
+        // scaled_share = 7_200 × 10000 / 10_000 = 7_200 -> burst = min(200+7_200, 2_000) = 2_000.
+        assert_eq!(c.macro_state.nutrient_burst_bps, 2_000);
+        assert_eq!(c.macro_state.nutrient_burst_until, 1); // current_epoch 0 + 1
+        assert_eq!(c.get_burst_state(), (U128(2_000), 1));
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"nutrient_burst_released""#), "burst event hilang");
+        assert!(logs.contains(r#""released_vita":7200"#));
+        assert!(logs.contains(r#""until_epoch":1"#));
+    }
+
+    /// `TC-NB-02` — likuidasi kedua tidak melampaui `MAX_BURST_BPS`.
+    #[test]
+    fn en102_tc_nb02_burst_tak_melebihi_cap() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 10_000u128, EXTRACTOR_ROLE, 0);
+        let _ = call_incubate(&mut c, 10_000u128, FERMENTER_ROLE, 0);
+        let ts = 3_600_000_000_000 + 200 * 3_600_000_000_000;
+        set_context_at("raider.testnet", NearToken::from_yoctonear(0), ts);
+        let _ = c.harvest_starving_strain(1);
+        let _ = c.harvest_starving_strain(2);
+        assert!(c.macro_state.nutrient_burst_bps <= constants::MAX_BURST_BPS);
+    }
+
+    /// `EN-103` — `feed_strain`: diskon burst mengurangi fee efektif; normal setelah
+    /// `until` (`TC-NB-03`); event `fed`. Catatan: fee kecil di supply kecil selalu
+    /// ber zona Hypothermia (temp < 600) — debit bersih = effective_fee − rebate.
+    #[test]
+    fn en103_feed_diskon_burst_dan_kedaluwarsa() {
+        let mut c = dk_setup(); // saldo strain 8_000, treasury 2_000
+        // Nyalakan burst manual (pola sama dengan EN-102).
+        c.macro_state.nutrient_burst_bps = 500;
+        c.macro_state.nutrient_burst_until = 1;
+        c.macro_state.epoch_treasury_initial = c.treasury;
+
+        let bal0 = c.snacc_balances.get(&1).copied().unwrap();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let v = c.feed_strain(1, U128(1_000));
+        // effective_fee = 1_000 × (10000−500)/10000 = 950; rebate hypo = 950×200/10000 = 19.
+        let bal1 = c.snacc_balances.get(&1).copied().unwrap();
+        assert_eq!(bal0 - bal1, 950 - 19);
+        assert_eq!(v.last_fed_sec, 3600); // metabolisme pulih
+        let logs = near_sdk::test_utils::get_logs().join("\n");
+        assert!(logs.contains(r#""event":"fed""#), "event fed hilang");
+        assert!(logs.contains(r#""effective_fee":950"#));
+
+        // `TC-NB-03`: burst kedaluwarsa setelah `until` — fee kembali penuh.
+        c.advance_epoch(); // current_epoch = 1 == until -> burst mati
+        assert_eq!(c.get_burst_state(), (U128(0), 1));
+        let bal2 = c.snacc_balances.get(&1).copied().unwrap();
+        c.feed_strain(1, U128(1_000));
+        let bal3 = c.snacc_balances.get(&1).copied().unwrap();
+        // Tanpa diskon: effective 1_000; volume 950+1_000 = 1_950 -> temp 195 (hypo);
+        // kuota I-04 sisa 100−19 = 81; rebate = min(20, 81) = 20.
+        assert_eq!(bal2 - bal3, 1_000 - 20);
+    }
+
+    /// `EN-104` — cap diskon 5% Pantry/epoch (kuota `I-04` dipakai bersama rebate).
+    #[test]
+    fn en104_cap_diskon_5_pantry_per_epoch() {
+        let mut c = dk_setup();
+        c.macro_state.nutrient_burst_bps = 2_000;
+        c.macro_state.nutrient_burst_until = 1;
+        // Kuota I-04 = 500 bps dari epoch_treasury_initial 10_000 = 500.
+        c.macro_state.epoch_treasury_initial = 10_000;
+        c.macro_state.epoch_burst_discount_granted = 490;
+
+        let bal0 = c.snacc_balances.get(&1).copied().unwrap();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(1_000));
+        // raw discount = 1_000 × 2_000/10_000 = 200; sisa kuota 500−0−490 = 10
+        // -> diskon dipotong jadi 10; effective_fee = 990.
+        // Zona hypo (temp 99): rebate = 990×200/10000 = 19 (kuota rebate terpisah dari
+        // pemakaian burst hanya melalui `granted`); debit bersih = 990 − 19 = 971.
+        let bal1 = c.snacc_balances.get(&1).copied().unwrap();
+        assert_eq!(bal0 - bal1, 971);
+        assert_eq!(c.macro_state.epoch_burst_discount_granted, 500); // cap tercapai
+        assert_eq!(c.macro_state.epoch_treasury_spent, 19);
+    }
+
+    /// `TC-NB-01` — loop 1.000 feed saat burst aktif: saldo pemain turun bersih
+    /// (`DK-030`: diskon tidak boleh membuat feed menguntungkan) + konservasi `I-01`.
+    #[test]
+    fn en104_tc_nb01_loop_1000_feed_tetap_merugi() {
+        let mut c = SnaccContract::new();
+        let _ = call_incubate(&mut c, 1_000_000_000u128, EXTRACTOR_ROLE, 0); // saldo 8e8, treasury 2e8
+        c.macro_state.nutrient_burst_bps = 2_000;
+        c.macro_state.nutrient_burst_until = 1;
+        c.macro_state.epoch_treasury_initial = c.treasury;
+
+        let bal0 = c.snacc_balances.get(&1).copied().unwrap();
+        for i in 0..1_000 {
+            if i % 10 == 0 {
+                // testing_env! membuat ulang blockchain mock -> buffer log 16 KB ter-reset
+                // (storage dipertahankan); loop 1.000 feed memancarkan 2 event/feed.
+                set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+            }
+            c.feed_strain(1, U128(1_000));
+        }
+        let bal1 = c.snacc_balances.get(&1).copied().unwrap();
+        // Per feed: effective 800 (diskon 20%); zona hypo sepanjang loop (volume 800n
+        // -> temp < 1) -> rebate 800×200/10000 = 16. Debit bersih = 784/feed.
+        assert_eq!(bal0 - bal1, 784_000);
+        // Konservasi `DK-033` (inflow epoch berjalan dihitung terpisah):
+        // treasury + pool + inflow + burned + saldo strain = supply (feed normal tidak burn).
+        assert_eq!(
+            c.treasury
+                + c.macro_state.industrial_dividend_pool
+                + c.macro_state.epoch_dividend_inflow
+                + c.macro_state.total_snacc_burned
+                + bal1,
+            1_000_000_000
+        );
+    }
+
+    /// `EN-103` — feed oleh non-owner ditolak; feed 0 ditolak.
+    #[test]
+    #[should_panic(expected = "ERR_NOT_OWNED_BY_CALLEE")]
+    fn en103_feed_non_owner_ditolak() {
+        let mut c = dk_setup();
+        set_context("raider.testnet", NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(100));
+    }
+
+    /// `EN-103` — feed melebihi saldo strain -> `ERR_INSUFFICIENT_BALANCE`.
+    #[test]
+    #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
+    fn en103_feed_saldo_kurang_ditolak() {
+        let mut c = dk_setup();
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        c.feed_strain(1, U128(9_000)); // saldo 8_000
+    }
+
+    /// `F2` — aether kini dapat disintesis bila strain pernah sukses mutasi TEE
+    /// (`phenotype_trait.is_some()`); tanpa mutasi tetap `ERR_REQUIRES_TEE_ATTESTATION`.
+    #[test]
+    fn dk044_aether_tersintesis_setelah_mutasi_tee() {
+        let mut c = dk_setup();
+        let mut v = c.strains.get(&2).unwrap().clone();
+        v.phenotype_trait = Some("Thermo-Aureate".to_string());
+        let _ = c.strains.insert(2, v);
+        // Resep aether (keputusan tercatat): 2 amalgam + 1 synthase per batch.
+        let _ = c.inventories.insert((2, "mt:enzyme-amalgam".to_string()), 2);
+        let _ = c.inventories.insert((2, "mt:enzyme-synthase".to_string()), 1);
+        set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
+        let _ = c.synthesize_elixir(2, "mt:elixir-aether".to_string(), 3, U128(0));
+        assert_eq!(c.inventories.get(&(2, "mt:elixir-aether".to_string())), Some(&1));
     }
 }
