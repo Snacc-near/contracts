@@ -20,10 +20,16 @@ pub const VERSION: &str = "1.0.0";
 /// `kind` diangkat menjadi field `event` di envelope; payload utuh masuk `data[0]`
 /// sehingga konsumen (indexer `M5`, parser `SDK-107..108`) menerima seluruh detail.
 pub fn emit_event_json(payload_json: &str) {
-    let event = extract_kind(payload_json).unwrap_or("unknown");
+    emit_standard_event(STANDARD, extract_kind(payload_json).unwrap_or("unknown"), payload_json);
+}
+
+/// Emit event `NEP-297` dengan `standard` eksplisit — dipakai standar eksternal
+/// (`nep141` untuk event `ft_*` sesuai keputusan `N141-101..106`).
+/// `event` adalah nama event (field `event` envelope), payload utuh masuk `data[0]`.
+pub fn emit_standard_event(standard: &str, event: &str, payload_json: &str) {
     near_sdk::env::log_str(&format!(
         r#"EVENT_JSON:{{"standard":"{}","version":"{}","event":"{}","data":[{}]}}"#,
-        STANDARD, VERSION, event, payload_json
+        standard, VERSION, event, payload_json
     ));
 }
 
