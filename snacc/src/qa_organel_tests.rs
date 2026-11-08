@@ -41,7 +41,8 @@ mod qa_organel_tests {
         // Biaya = 1 ATP per KENAIKAN level: 0→1→2→3→4→5 = 5 kenaikan × 1 ATP.
         for level in 1..=5u8 {
             if level > 1 {
-                c.advance_epoch(); // epoch bergerak via advance_epoch, bukan waktu
+                c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        c.advance_epoch(); // epoch bergerak via advance_epoch, bukan waktu
             }
             ctx("alkemis.testnet", 0, 1_000);
             let v = c.allocate_atp(id, level, 0, 0);
@@ -49,6 +50,7 @@ mod qa_organel_tests {
             assert_eq!(v.atp_balance, 50 - u128::from(level), "biaya kumulatif {level}");
         }
         // Level 6 → ditolak.
+        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -69,6 +71,7 @@ mod qa_organel_tests {
         assert_eq!(v.atp_balance, 45, "biaya 5 ATP (1 per level)");
         // Tidak ada efek sekunder yang bisa diamati selain penyimpanan —
         // atp_balance hanya berubah oleh biaya alokasi ini.
+        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let v2 = c.allocate_atp(id, 0, 3, 0); // turunkan level → gratis
@@ -86,11 +89,13 @@ mod qa_organel_tests {
         assert_eq!(v.organel.lisosom, 4);
         assert_eq!(v.atp_balance, 46);
         // Naik ke 5 di epoch berikutnya (biaya 1).
+        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let v2 = c.allocate_atp(id, 0, 0, 5);
         assert_eq!(v2.atp_balance, 45);
         // Reset ke 0 (gratis) — slot bisa dikosongkan.
+        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let v3 = c.allocate_atp(id, 0, 0, 0);
@@ -141,6 +146,7 @@ mod qa_organel_tests {
             "nukleus 0 → 8×1,08×1,0 = 8,64 → 8"
         );
         // Synthesize: nukleus ikut mengalikan eliksir (2 batch × 1,5 = 3).
+        ca.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         ca.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let _ = ca.inventories.insert((ida, "mt:enzyme-amalgam".to_string()), 4);
@@ -170,6 +176,7 @@ mod qa_organel_tests {
             "lisosom 4 → BMR eff 60/jam (selamat lebih lama; tanpa lisosom sudah 1500/Distressed)"
         );
         // Batas: lisosom 5 → BMR eff 50 (min via cap level; bukan 0).
+        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000 + 70 * 3_600);
         let v5 = c.allocate_atp(id, 0, 0, 5);
