@@ -38,6 +38,17 @@ pub mod constants {
     pub const MAX_COLONY_SIZE: u8 = 5;
     /// Pagar populasi (`EN-08`).
     pub const MAX_GENERATION: u8 = 8;
+    /// LC-06 — fusi (`splice_strains`): `BMR −15%` (Siklus Hidup LC-06, Narasi "Merge").
+    pub const SPLICE_BMR_REDUCTION_BPS: u64 = 1500;
+    /// Gerbang waktu `advance_epoch`: durasi satu epoch (detik). Kamus Angka belum
+    /// menominalkan `EPOCH_LEN` — keputusan sesi 2026-11-08: 24 jam (loop harian);
+    /// demo memajukan waktu lewat `advance_sandbox_clock` (`ADR-22`).
+    pub const EPOCH_DURATION_SEC: u64 = 86_400;
+    pub const ERR_EPOCH_NOT_ENDED: &str = "ERR_EPOCH_NOT_ENDED";
+    /// `ADR-22` — `advance_sandbox_clock` di luar mode sandbox (akun bukan `.testnet`).
+    pub const ERR_SANDBOX_CLOCK_DISABLED: &str = "ERR_SANDBOX_CLOCK_DISABLED";
+    /// Batas satu panggilan `advance_sandbox_clock` (30 hari) — anti-overflow/typo.
+    pub const MAX_SANDBOX_ADVANCE_HOURS: u64 = 720;
     /// Batas atas diskon Nutrient Burst (`EN-01`, spec `0..2000`).
     pub const MAX_BURST_BPS: u16 = 2000;
     /// `F1` — vitalitas awal Strain Genesis = `8500` (`85.00%`).
@@ -273,6 +284,18 @@ pub enum StrainStatus {
     SplicedBurned,
 }
 
+/// `SolvencyTier` (Model Data, Spec Antarmuka §2 `get_solvency_tier`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SolvencyTier {
+    /// `> 2000` (>20%).
+    Tier1Healthy,
+    /// `1..=2000` (1..20%) — terbuka untuk hostile takeover.
+    Tier2Chapter11Distressed,
+    /// `0` — terbuka untuk `harvest_starving_strain`.
+    Tier3Chapter7Insolvent,
+}
+
 /// Kasta peran industri `Homunculus Strain` (`NEP-171`, `I-08`).
 /// Enum menjamin role tunggal saat Genesis; multi-bit hanya lewat `splice_strains`.
 #[near(serializers = [borsh, json])]
@@ -409,8 +432,30 @@ impl StrainVessel {
             generation: self.generation,
             organel: self.organel.clone(),
             last_allocate_epoch: self.last_allocate_epoch,
-            status: self.status.clone(),
+            status: self.view_status(now_sec),
             effective_vitality: self.effective_vitality(now_sec),
+        }
+    }
+
+    /// Audit W10 — status untuk view: status tersimpan `Active` diturunkan ke
+    /// `Distressed` saat `1 <= effective_vitality <= 2000` (Tier 2, Lazy BMR —
+    /// status dihitung di view, tanpa keeper). Tier 3 (`0`) tetap `Active` sampai
+    /// `harvest_starving_strain` (→ `Liquidated`); gunakan `get_solvency_tier`.
+    pub fn view_status(&self, now_sec: u64) -> StrainStatus {
+        match self.status {
+            StrainStatus::Active if (1..=2000).contains(&self.effective_vitality(now_sec)) => {
+                StrainStatus::Distressed
+            }
+            ref s => s.clone(),
+        }
+    }
+
+    /// `get_solvency_tier` (Spec Antarmuka §2) — tangga 3 tingkat `I-02`.
+    pub fn solvency_tier(&self, now_sec: u64) -> SolvencyTier {
+        match self.effective_vitality(now_sec) {
+            0 => SolvencyTier::Tier3Chapter7Insolvent,
+            1..=2000 => SolvencyTier::Tier2Chapter11Distressed,
+            _ => SolvencyTier::Tier1Healthy,
         }
     }
 
@@ -506,6 +551,8 @@ impl Default for TermostatParams {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroState {
     pub current_epoch: Epoch,
+    /// Audit W6 — epoch berjalan baru boleh ditutup saat `now_sec() >= epoch_ends_sec`.
+    pub epoch_ends_sec: u64,
     /// Timestamp blok (ms) pembaruan terakhir — **dari `env::block_timestamp_ms()`** (`V-02`).
     pub last_update_ms: u64,
     /// `V_epoch` — volume aktivitas ter-decay untuk `CrucibleTemp = 1000 × V / M_supply`.
@@ -560,6 +607,7 @@ impl Default for MacroState {
     fn default() -> Self {
         Self {
             current_epoch: 0,
+            epoch_ends_sec: 0,
             last_update_ms: 0,
             volume_epoch: 0,
             total_snacc_supply: 0,
@@ -593,6 +641,8 @@ impl Default for MacroState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroStateView {
     pub current_epoch: Epoch,
+    /// Audit W6 — epoch berjalan baru boleh ditutup saat `now_sec() >= epoch_ends_sec`.
+    pub epoch_ends_sec: u64,
     pub last_update_ms: u64,
     pub volume_epoch: u128,
     pub total_snacc_supply: u128,
@@ -655,6 +705,7 @@ impl MacroState {
     pub fn to_view(&self, now_ms: u64) -> MacroStateView {
         MacroStateView {
             current_epoch: self.current_epoch,
+            epoch_ends_sec: self.epoch_ends_sec,
             last_update_ms: self.last_update_ms,
             volume_epoch: self.volume_epoch,
             total_snacc_supply: self.total_snacc_supply,
