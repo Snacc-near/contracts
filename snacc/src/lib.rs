@@ -714,12 +714,14 @@ impl SnaccContract {
             v.record_mutation();
             let _ = self.strains.insert(strain_id, v);
         }
-        // `N141` — NEP-297 event with standard `nep141` (`ft_burn`).
+        // `N141-105` — NEP-297 event with standard `nep141` (`ft_burn`):
+        // `amount` is a decimal string (u128) and `memo` is `null` per the
+        // NEP-141 events standard (a JSON number loses precision above 2^53).
         events::emit_standard_event(
             "nep141",
             "ft_burn",
             &format!(
-                r#"{{"owner_id":"{}","amount":{}}}"#,
+                r#"{{"owner_id":"{}","amount":"{}","memo":null}}"#,
                 self.strains
                     .get(&strain_id)
                     .map(|v| v.owner_id.to_string())
@@ -2036,16 +2038,18 @@ impl SnaccContract {
             let recv = self.account_balance(&receiver_id);
             self.set_account_balance(&receiver_id, recv.saturating_add(amount.0));
         }
+        // `N141-105` — `amount` is a decimal string (u128) and `memo` is a
+        // JSON string or `null` per the NEP-141 events standard.
         events::emit_standard_event(
             "nep141",
             "ft_transfer",
             &format!(
-                r#"{{"old_owner_id":"{}","new_owner_id":"{}","amount":{},"memo":{}}}"#,
+                r#"{{"old_owner_id":"{}","new_owner_id":"{}","amount":"{}","memo":{}}}"#,
                 sender_id,
                 receiver_id,
                 amount.0,
                 match memo {
-                    Some(m) => format!(r#""{}""#, m),
+                    Some(m) => near_sdk::serde_json::to_string(&m).unwrap(),
                     None => "null".to_string(),
                 }
             ),
@@ -3387,7 +3391,7 @@ impl SnaccContract {
                 receiver_id,
                 token_id,
                 match memo {
-                    Some(m) => format!(r#""{}""#, m),
+                    Some(m) => near_sdk::serde_json::to_string(&m).unwrap(),
                     None => "null".to_string(),
                 }
             ),

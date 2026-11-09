@@ -267,8 +267,8 @@ mod qa_nep_tests {
     }
 
     /// Sum the `amount` of every `EVENT_JSON` line with `"event":"<event>"`.
-    /// Handles both encodings: `ft_mint` uses the NEP-141 string form
-    /// (`"amount":"123"`), the legacy `ft_transfer`/`ft_burn` use a number.
+    /// All NEP-141 events use the string form (`"amount":"123"`); the parser
+    /// still tolerates a bare number for robustness against old logs.
     fn sum_in(logs: &[String], event: &str) -> u128 {
         let marker = format!(r#""event":"{}""#, event);
         let mut total = 0u128;
@@ -476,5 +476,69 @@ mod qa_nep_tests {
             "I-01: the event net must equal the supply"
         );
         assert_eq!(supply, stake_a + stake_b - 500);
+    }
+
+    /// TC-NEP-13 — N141-105: `ft_transfer` and `ft_burn` MUST encode `amount`
+    /// as a decimal string (NEP-141), `memo` as a JSON string or `null`, and
+    /// a value above 2^53 must survive string round-trip losslessly.
+    #[test]
+    fn tc_nep13_ft_transfer_and_ft_burn_amount_is_string() {
+        let stake_a: u128 = 10u128.pow(18);
+        let big: u128 = 9_007_199_254_740_993; // 2^53 + 1, not representable as f64
+        let mut all = Vec::new();
+        ctx("alkemis.testnet", stake_a, 1_000);
+        let mut c = SnaccContract::new();
+        ctx("alkemis.testnet", stake_a, 1_000);
+        let s1 = c.incubate_strain(StrainRole::Extractor, U128(stake_a), 0).strain_id;
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", stake_a, 1_000);
+        let s2 = c.incubate_strain(StrainRole::Extractor, U128(stake_a), 0).strain_id;
+        drain_logs(&mut all);
+
+        // Register bob, then fund alkemis's account by harvesting s1 (its
+        // balance is zeroed, so the burn below uses s2).
+        let min = NearToken::from_millinear(5).as_yoctonear();
+        ctx("bob.testnet", min, 1_000);
+        let _ = c.storage_deposit(None, None);
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", 0, 1_000 + 90 * 3600);
+        let (bounty, _) = c.harvest_starving_strain(s1);
+        drain_logs(&mut all);
+        assert!(bounty.0 > big, "the bounty must cover the big transfer");
+
+        ctx("alkemis.testnet", 1, 1_000);
+        c.ft_transfer(test_account("bob.testnet"), U128(big), None);
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", 0, 1_000);
+        c.ft_burn(s2, U128(big));
+        drain_logs(&mut all);
+
+        let expected_transfer = format!(
+            r#"EVENT_JSON:{{"standard":"nep141","version":"1.0.0","event":"ft_transfer","data":[{{"old_owner_id":"alkemis.testnet","new_owner_id":"bob.testnet","amount":"{}","memo":null}}]}}"#,
+            big
+        );
+        assert!(
+            all.iter().any(|l| l == &expected_transfer),
+            "exact ft_transfer string-amount line missing:\n{expected_transfer}\nlogs: {:?}",
+            all
+        );
+        let expected_burn = format!(
+            r#"EVENT_JSON:{{"standard":"nep141","version":"1.0.0","event":"ft_burn","data":[{{"owner_id":"alkemis.testnet","amount":"{}","memo":null}}]}}"#,
+            big
+        );
+        assert!(
+            all.iter().any(|l| l == &expected_burn),
+            "exact ft_burn string-amount line missing:\n{expected_burn}\nlogs: {:?}",
+            all
+        );
+        for line in &all {
+            if line.contains(r#""event":"ft_transfer""#) || line.contains(r#""event":"ft_burn""#) {
+                let at = line.find(r#""amount":"#).expect("amount field present");
+                assert_eq!(&line[at..at + 10], r#""amount":""#, "amount must be a JSON string");
+            }
+        }
+        assert_eq!(sum_in(&all, "ft_transfer"), big, "2^53+1 survives string round-trip");
+        assert_eq!(sum_in(&all, "ft_burn"), big, "2^53+1 survives string round-trip");
+        assert_eq!(c.ft_balance_of(test_account("bob.testnet")).0, big);
     }
 }
