@@ -24,15 +24,15 @@ mod qa_regression_tests {
     /// A valid 32-byte hex request hash (64 chars) for `commit_genome_experiment`.
     const REQ_SHA_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn akun(s: &str) -> AccountId {
+    fn test_account(s: &str) -> AccountId {
         s.parse().unwrap()
     }
 
     fn ctx(pred: &str, deposit_yocto: u128, ts_ns: u64) {
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun(CONTRACT))
-            .signer_account_id(akun(pred))
-            .predecessor_account_id(akun(pred))
+        b.current_account_id(test_account(CONTRACT))
+            .signer_account_id(test_account(pred))
+            .predecessor_account_id(test_account(pred))
             .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
             .block_timestamp(ts_ns);
         testing_env!(b.build());
@@ -132,7 +132,7 @@ mod qa_regression_tests {
             1,
             "a successful adopt must bump the target nonce"
         );
-        assert_eq!(c.strains.get(&1).unwrap().owner_id, akun(RAIDER_A));
+        assert_eq!(c.strains.get(&1).unwrap().owner_id, test_account(RAIDER_A));
 
         // Raider B races the same target with the stale expected nonce → must lose.
         ctx(RAIDER_B, 0, T0_NS + 70 * HOUR_NS);
@@ -144,8 +144,8 @@ mod qa_regression_tests {
             "unexpected error: {msg}"
         );
         // One winner: the target moved once; the loser's own strain is untouched.
-        assert_eq!(c.strains.get(&1).unwrap().owner_id, akun(RAIDER_A));
-        assert_eq!(c.strains.get(&3).unwrap().owner_id, akun(RAIDER_B));
+        assert_eq!(c.strains.get(&1).unwrap().owner_id, test_account(RAIDER_A));
+        assert_eq!(c.strains.get(&3).unwrap().owner_id, test_account(RAIDER_B));
     }
 
     /// The adopt window (eff 1..=2000) and the harvest window (eff == 0) are
@@ -164,7 +164,7 @@ mod qa_regression_tests {
         assert!(msg.contains("ERR_STRAIN_NOT_INSOLVENT"), "unexpected error: {msg}");
         ctx(RAIDER_A, 0, T0_NS + 70 * HOUR_NS);
         let _ = c.adopt(1, 2, 0); // the only viable path here
-        assert_eq!(c.strains.get(&1).unwrap().owner_id, akun(RAIDER_A));
+        assert_eq!(c.strains.get(&1).unwrap().owner_id, test_account(RAIDER_A));
 
         // Tier 3 (eff 0): adopt CANNOT win, harvest CAN.
         let mut c = race_setup();
@@ -216,7 +216,7 @@ mod qa_regression_tests {
 
     /// Living (not Liquidated/SplicedBurned) strains of `owner`, ascending by id.
     fn living_ids_of(c: &SnaccContract, owner: &str) -> Vec<StrainId> {
-        let owner = akun(owner);
+        let owner = test_account(owner);
         let mut out = Vec::new();
         for id in 1..c.next_strain_id {
             if let Some(v) = c.strains.get(&id) {
@@ -514,7 +514,7 @@ mod qa_regression_tests {
         ctx(ALICE, 0, now_ns);
         let _ = c.harvest_starving_strain(victim);
         assert!(
-            c.account_balance(&akun(ALICE)) > 0,
+            c.account_balance(&test_account(ALICE)) > 0,
             "the 10% liquidation bounty must fund ALICE"
         );
         assert_cash_invariant(&c, "warmup harvest bounty", 2);
@@ -542,7 +542,7 @@ mod qa_regression_tests {
 
         // 3 · ft_transfer (registered peer, exactly 1 yoctoNEAR; ≤ ALICE's bounty balance).
         ctx(ALICE, 1, now_ns);
-        c.ft_transfer(akun(BOB), U128(100), None);
+        c.ft_transfer(test_account(BOB), U128(100), None);
         ok[3] += 1;
         assert_cash_invariant(&c, "warmup ft_transfer", 3);
 
@@ -628,14 +628,14 @@ mod qa_regression_tests {
                     } else {
                         (BOB, ALICE)
                     };
-                    let bal = c.account_balance(&akun(from));
+                    let bal = c.account_balance(&test_account(from));
                     if bal == 0 {
                         false
                     } else {
                         let amount = 1 + rng.below(bal.min(1_000) as u64) as u128;
                         ctx(from, 1, now_ns); // exactly 1 yoctoNEAR
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            c.ft_transfer(akun(to), U128(amount), None)
+                            c.ft_transfer(test_account(to), U128(amount), None)
                         }))
                         .is_ok()
                     }
