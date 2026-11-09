@@ -1,53 +1,53 @@
 //! State `D1–D8` — `VC-002` ([[Snacc - Model Data]]).
 //!
-//! Nama field/method disalin persis dari spec: [[Snacc - Spec Antarmuka Kontrak]],
-//! `ADR-22/25/26/29`, dan **Kamus Angka Resmi** ([[Snacc - Model Data]]).
-//! Semua struct inti memakai `#[near(serializers = [borsh, json])]` (DoD `VC-002`).
+//! Field/method names are copied verbatim from the spec: [[Snacc - Spec Antarmuka Kontrak]],
+//! `ADR-22/25/26/29`, and the **Kamus Angka Resmi** ([[Snacc - Model Data]]).
+//! All core structs use `#[near(serializers = [borsh, json])]` (DoD `VC-002`).
 
 use near_sdk::{AccountId, near};
 
 pub type StrainId = u64;
-pub type TokenId = String; // `NEP-245`, mis. `mt:spore-ignis`
+pub type TokenId = String; // `NEP-245`, e.g. `mt:spore-ignis`
 pub type Epoch = u64;
 
-/// Konstanta kanonik (Kamus Angka Resmi — jangan pakai angka lain).
+/// Canonical constants (the Kamus Angka Resmi — do not use any other numbers).
 pub mod constants {
     /// Guardrail mutasi TEE (`ADR-21`): `maxShiftBps = ±1500`.
     pub const MAX_SHIFT_BPS: u16 = 1500;
-    /// Calcination Fever saat `CrucibleTemp > 610` mK — **ECON-111 FINAL (keputusan
-    /// pemilik 2026-11-08, supersede 1400)**: kalibrasi Opsi B `VOLUME_SCALE = 5`.
-    /// (Hypothermia tetap 600 mK; zona Normal = [600, 610].)
+    /// Calcination Fever when `CrucibleTemp > 610` mK — **ECON-111 FINAL (owner
+    /// decision 2026-11-08, supersedes 1400)**: Option B calibration `VOLUME_SCALE = 5`.
+    /// (Hypothermia stays 600 mK; the Normal zone = [600, 610].)
     pub const FEVER_THRESHOLD_MK: u64 = 610;
-    /// Hypothermia Rebate saat `CrucibleTemp < 600` mK.
+    /// Hypothermia Rebate when `CrucibleTemp < 600` mK.
     pub const HYPOTHERMIA_THRESHOLD_MK: u64 = 600;
-    /// `ft_burn 350 bps` (3,5%) pada biaya katalis saat Fever.
+    /// `ft_burn 350 bps` (3.5%) on the catalyst cost during Fever.
     pub const FEVER_BURN_BPS: u16 = 350;
-    /// Subsidi `200 bps` (2,0%) dari treasury saat Hypothermia.
+    /// A `200 bps` (2.0%) subsidy from the treasury during Hypothermia.
     pub const REBATE_BPS: u16 = 200;
     /// Cap drain treasury `500 bps`/epoch (5% Pantry/epoch, invariant `I-04`).
     pub const MAX_EPOCH_TREASURY_DRAIN_BPS: u16 = 500;
     /// Peluruhan volume kontinu (`VOLUME_DECAY_PER_SEC = 50`).
     pub const VOLUME_DECAY_PER_SEC: u64 = 50;
-    /// Bounty Cell Lysis: `10%` likuidator / `90%` `Rule-Bound Treasury`.
+    /// Cell Lysis bounty: `10%` liquidator / `90%` `Rule-Bound Treasury`.
     pub const LIQUIDATOR_BOUNTY_BPS: u16 = 1000;
-    /// Pajak merger `2.5%` ke Treasury (`ADR-25`).
+    /// A `2.5%` merger tax to the Treasury (`ADR-25`).
     pub const MERGER_TAX_BPS: u16 = 250;
-    /// Premi hostile takeover: `book value + 15%` (`ADR-26` Tier 2).
+    /// Hostile takeover premium: `book value + 15%` (`ADR-26` Tier 2).
     pub const HOSTILE_PREMIUM_BPS: u16 = 1500;
-    /// Pagar koloni (`EN-08`).
+    /// Colony fence (`EN-08`).
     pub const MAX_COLONY_SIZE: u8 = 5;
-    /// Pagar populasi (`EN-08`).
+    /// Population fence (`EN-08`).
     pub const MAX_GENERATION: u8 = 8;
-    /// LC-06 — fusi (`splice_strains`): `BMR −15%` (Siklus Hidup LC-06, Narasi "Merge").
+    /// LC-06 — fusion (`splice_strains`): `BMR −15%` (Lifecycle LC-06, Narrative "Merge").
     pub const SPLICE_BMR_REDUCTION_BPS: u64 = 1500;
-    /// Gerbang waktu `advance_epoch`: durasi satu epoch (detik). Kamus Angka belum
-    /// menominalkan `EPOCH_LEN` — keputusan sesi 2026-11-08: 24 jam (loop harian);
-    /// demo memajukan waktu lewat `advance_sandbox_clock` (`ADR-22`).
+    /// The `advance_epoch` time gate: the duration of one epoch (seconds). The Kamus Angka
+    /// has not nominalized `EPOCH_LEN` — the 2026-11-08 session decision: 24 hours (a daily loop);
+    /// the demo advances time via `advance_sandbox_clock` (`ADR-22`).
     pub const EPOCH_DURATION_SEC: u64 = 86_400;
     pub const ERR_EPOCH_NOT_ENDED: &str = "ERR_EPOCH_NOT_ENDED";
-    /// `ADR-22` — `advance_sandbox_clock` di luar mode sandbox (akun bukan `.testnet`).
+    /// `ADR-22` — `advance_sandbox_clock` outside sandbox mode (an account that is not `.testnet`).
     pub const ERR_SANDBOX_CLOCK_DISABLED: &str = "ERR_SANDBOX_CLOCK_DISABLED";
-    /// Batas satu panggilan `advance_sandbox_clock` (30 hari) — anti-overflow/typo.
+    /// The cap of one `advance_sandbox_clock` call (30 days) — anti-overflow/typo.
     pub const MAX_SANDBOX_ADVANCE_HOURS: u64 = 720;
     /// Batas atas diskon Nutrient Burst (`EN-01`, spec `0..2000`).
     pub const MAX_BURST_BPS: u16 = 2000;
@@ -55,69 +55,69 @@ pub mod constants {
     pub const INITIAL_VITALITY: u64 = 8500;
     /// `F1` — efisiensi awal = `10000` bps (`1.00x`).
     pub const INITIAL_EFFICIENCY_BPS: u16 = 10000;
-    /// `F1` — `bmr_per_hour` awal per kasta (`Katalog Molekul`).
+    /// `F1` — initial `bmr_per_hour` per caste (`Katalog Molekul`).
     pub const BMR_EXTRACTOR_PER_HOUR: u64 = 100;
     pub const BMR_FERMENTER_PER_HOUR: u64 = 120;
     pub const BMR_SYNTHESIZER_PER_HOUR: u64 = 150;
-    /// `ADR-25` / `I-08` — bitmask peran Coasean (wajib tunggal saat Genesis).
+    /// `ADR-25` / `I-08` — the Coasean role bitmask (must be single at Genesis).
     pub const ROLE_EXTRACTOR: u8 = 0b001;
     pub const ROLE_FERMENTER: u8 = 0b010;
     pub const ROLE_SYNTHESIZER: u8 = 0b100;
-    /// `F1` — `20%` fee inkubasi ke `Rule-Bound Treasury`; `80%` modal kerja Strain.
+    /// `F1` — `20%` of the incubation fee to the `Rule-Bound Treasury`; `80%` Strain working capital.
     pub const STAKE_TREASURY_BPS: u128 = 2000;
     pub const BPS_DENOMINATOR: u128 = 10000;
     /// `F1` — deposit minimum `materialize_subaccount` = `0.02 NEAR` (20 milliNEAR).
     pub const MIN_MATERIALIZE_DEPOSIT_MILLINEAR: u128 = 20;
-    /// `F1` — jumlah spora genesis yang dicetak per inkubasi (`Spec F1`, belum ternominalisasi).
+    /// `F1` — the number of genesis spores minted per incubation (`Spec F1`, not yet nominalized).
     pub const GENESIS_SPORE_AMOUNT: u64 = 1;
     /// `F1` — format sub-account kanonik `s-<id>.snacc-v001.near`.
     pub const VAULT_SUBACCOUNT_PREFIX: &str = "s-";
-    /// `F1` — kode error: strain sudah pernah diinkubasi.
+    /// `F1` — error code: the strain was already incubated.
     pub const ERR_STRAIN_ALREADY_INCUBATED: &str = "ERR_STRAIN_ALREADY_INCUBATED";
-    /// `F1` — kode error: role bitmask bukan tunggal bit.
+    /// `F1` — error code: the role bitmask is not a single bit.
     pub const ERR_ROLE_MASK_NOT_SINGLE: &str = "ERR_ROLE_MASK_NOT_SINGLE";
-    /// `F1` — kode error: deposit `materialize_subaccount` kurang dari 0.02 NEAR.
+    /// `F1` — error code: the `materialize_subaccount` deposit is below 0.02 NEAR.
     pub const ERR_INSUFFICIENT_DEPOSIT: &str = "ERR_INSUFFICIENT_DEPOSIT";
-    /// `F1` — kode error: pemanggil bukan owner strain.
+    /// `F1` — error code: the caller is not the strain owner.
     pub const ERR_NOT_OWNED_BY_CALLEE: &str = "ERR_NOT_OWNED_BY_CALLEE";
-    /// `F1` — kode error: `initial_snacc_stake` nominal != attached deposit.
+    /// `F1` — error code: the `initial_snacc_stake` amount != the attached deposit.
     pub const ERR_STAKE_DEPOSIT_MISMATCH: &str = "ERR_STAKE_DEPOSIT_MISMATCH";
-    /// `F1` — kode error: strain tidak ditemukan.
+    /// `F1` — error code: strain not found.
     pub const ERR_STRAIN_NOT_FOUND: &str = "ERR_STRAIN_NOT_FOUND";
-    /// `F1` — token spora genesis `NEP-245` (`Katalog Molekul`, `DFD P1.3`).
+    /// `F1` — the `NEP-245` genesis spore token (`Katalog Molekul`, `DFD P1.3`).
     pub const GENESIS_SPORE_TOKEN_ID: &str = "mt:spore-ignis";
-    /// `ADR-02` — format sub-account. **Superseded pipeline #7**: suffix kini
-    /// diturunkan dari `env::current_account_id()` (parent kontrak selalu ada —
-    /// hardcode `.snacc-v001.near` gagal di testnet). Konstanta dipertahankan
-    /// hanya sebagai dokumentasi format mainnet.
+    /// `ADR-02` — the sub-account format. **Superseded by pipeline #7**: the suffix is now
+    /// derived from `env::current_account_id()` (the contract parent always exists —
+    /// hardcoding `.snacc-v001.near` fails on testnet). The constant is kept
+    /// only as documentation of the mainnet format.
     pub const VAULT_SUBACCOUNT_SUFFIX: &str = ".snacc-v001.near";
-    /// `F2` — pemulihan metabolik per transmutasi sukses: `vitality +500`.
+    /// `F2` — metabolic recovery per successful transmutation: `vitality +500`.
     pub const METABOLIC_RECOVERY_VITALITY: u64 = 500;
-    /// `I-02` — batas atas vitalitas (`0..=10000`).
+    /// `I-02` — the vitality cap (`0..=10000`).
     pub const VITALITY_CAP: u64 = 10000;
-    /// `F2` — id token `NEP-245` Tahap 1 (spora).
+    /// `F2` — `NEP-245` Stage 1 token ids (spores).
     pub const SPORE_TOKEN_IDS: [&str; 3] = ["mt:spore-ignis", "mt:spore-cryo", "mt:spore-lumin"];
-    /// `F2` — id token Tahap 2 (enzim, resep Katalog Molekul).
+    /// `F2` — Stage 2 token ids (enzymes, the Katalog Molekul recipes).
     pub const ENZYME_AMALGAM: &str = "mt:enzyme-amalgam";
     pub const ENZYME_REDACTASE: &str = "mt:enzyme-redactase";
     pub const ENZYME_SYNTHASE: &str = "mt:enzyme-synthase";
-    /// `F2` — id token Tahap 3 (eliksir).
+    /// `F2` — Stage 3 token ids (elixirs).
     pub const ELIXIR_HOMUNCULUS: &str = "mt:elixir-homunculus";
     pub const ELIXIR_HOMEOSTASIS: &str = "mt:elixir-homeostasis";
     pub const ELIXIR_AETHER: &str = "mt:elixir-aether";
-    /// `F2` — kode error rantai pasok.
+    /// `F2` — supply-chain error codes.
     pub const ERR_STRAIN_STARVING: &str = "ERR_STRAIN_STARVING";
     pub const ERR_UNKNOWN_TOKEN: &str = "ERR_UNKNOWN_TOKEN";
     pub const ERR_ROLE_NOT_ALLOWED: &str = "ERR_ROLE_NOT_ALLOWED";
     pub const ERR_INSUFFICIENT_BALANCE: &str = "ERR_INSUFFICIENT_BALANCE";
     pub const ERR_RECIPE_NOT_MET: &str = "ERR_RECIPE_NOT_MET";
     pub const ERR_REQUIRES_TEE_ATTESTATION: &str = "ERR_REQUIRES_TEE_ATTESTATION";
-    /// `F3` — model TEE verifikasi (Kamus Angka Resmi; pesan signed: `<model>:<req_sha256>:<res_sha256>`, `S2.6`).
+    /// `F3` — the TEE verification model (Kamus Angka Resmi; the signed message: `<model>:<req_sha256>:<res_sha256>`, `S2.6`).
     pub const TEE_MODEL_ID: &str = "z-ai/glm-5.3-flash";
     /// `I-03` — guardrail mutasi TEE.
     pub const TEE_SHIFT_LIMIT_BPS: i64 = 1500;
     pub const TEE_VITALITY_BONUS_CAP: u64 = 500;
-    /// `F3` — kode error TEE (nama mismatch diambil dari red-team spike `S1.9`).
+    /// `F3` — TEE error codes (the mismatch names come from the red-team spike `S1.9`).
     pub const ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH: &str =
         "ERR_TEE_RESPONSE_HASH_OR_ED25519_MISMATCH";
     pub const ERR_COMMITMENT_MISMATCH: &str = "ERR_COMMITMENT_MISMATCH";
@@ -130,19 +130,19 @@ pub mod constants {
     pub const ERR_BAD_HEX: &str = "ERR_BAD_HEX";
     pub const ERR_BAD_SIGNATURE_LEN: &str = "ERR_BAD_SIGNATURE_LEN";
     pub const ERR_NOT_CONTRACT_OWNER: &str = "ERR_NOT_CONTRACT_OWNER";
-    /// SEC-113 — menimpa kunci TEE terdaftar dengan attestation berbeda ditolak.
+    /// SEC-113 — overwriting a registered TEE key with a different attestation is rejected.
     pub const ERR_TEE_SIGNER_OVERWRITE: &str = "ERR_TEE_SIGNER_OVERWRITE";
-    /// DK-070 — kunci TEE yang mau dihapus tidak terdaftar.
+    /// DK-070 — the TEE key to remove is not registered.
     pub const ERR_TEE_SIGNER_NOT_FOUND: &str = "ERR_TEE_SIGNER_NOT_FOUND";
-    /// DK-073 — respons TEE melewati batas ukuran.
+    /// DK-073 — the TEE response exceeds the size cap.
     pub const ERR_TEE_RESPONSE_TOO_LARGE: &str = "ERR_TEE_RESPONSE_TOO_LARGE";
-    /// DK-074 — `phenotype_trait` di luar daftar putih / terlalu panjang.
+    /// DK-074 — `phenotype_trait` outside the whitelist / too long.
     pub const ERR_TEE_TRAIT_INVALID: &str = "ERR_TEE_TRAIT_INVALID";
-    /// `F5` — kode error merger (nama `ERR_NOT_SAME_OWNER` dari spec F5).
+    /// `F5` — merger error codes (the `ERR_NOT_SAME_OWNER` name from spec F5).
     pub const ERR_NOT_SAME_OWNER: &str = "ERR_NOT_SAME_OWNER";
     pub const ERR_SAME_STRAIN: &str = "ERR_SAME_STRAIN";
     pub const ERR_STRAIN_ALREADY_SPLICED: &str = "ERR_STRAIN_ALREADY_SPLICED";
-    /// `F2`/`F5` — sembilan id molekul `NEP-245` (Katalog Molekul).
+    /// `F2`/`F5` — the nine `NEP-245` molecule ids (Katalog Molekul).
     pub const ALL_TOKEN_IDS: [&str; 9] = [
         "mt:spore-ignis",
         "mt:spore-cryo",
@@ -154,14 +154,14 @@ pub mod constants {
         "mt:elixir-homeostasis",
         "mt:elixir-aether",
     ];
-    /// `F6` — kode error Cell Lysis (nama dari spec F6 & Alur POV).
+    /// `F6` — Cell Lysis error codes (names from spec F6 & the POV Flows).
     pub const ERR_STRAIN_NOT_INSOLVENT: &str = "ERR_STRAIN_NOT_INSOLVENT";
     pub const ERR_ALREADY_LIQUIDATED: &str = "ERR_ALREADY_LIQUIDATED";
-    /// `N141` — kode error: penerima `ft_transfer` belum terdaftar storage.
+    /// `N141` — error code: the `ft_transfer` receiver is not storage-registered yet.
     pub const ERR_ACCOUNT_NOT_REGISTERED: &str = "ERR_ACCOUNT_NOT_REGISTERED";
-    /// `N141` — kode error: `ft_transfer`/`ft_transfer_call` tanpa tepat 1 yoctoNEAR.
+    /// `N141` — error code: `ft_transfer`/`ft_transfer_call` without exactly 1 yoctoNEAR.
     pub const ERR_YOCTO_REQUIRED: &str = "ERR_YOCTO_REQUIRED";
-    /// `DK-033/044` — kode error (nama persis dari Spec Dividend Pool §6).
+    /// `DK-033/044` — error codes (exact names from the Spec Dividend Pool §6).
     pub const ERR_NOT_STRAIN_OWNER: &str = "ERR_NOT_STRAIN_OWNER";
     pub const ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE: &str =
         "ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE";
@@ -170,91 +170,91 @@ pub mod constants {
     pub const ERR_DIVIDEND_ALREADY_CLAIMED: &str = "ERR_DIVIDEND_ALREADY_CLAIMED";
     pub const ERR_DIVIDEND_CLAIM_EXPIRED: &str = "ERR_DIVIDEND_CLAIM_EXPIRED";
     pub const ERR_DIVIDEND_POOL_EMPTY: &str = "ERR_DIVIDEND_POOL_EMPTY";
-    /// `DK-033/044` — konstanta terdokumentasi (Spec Dividend Pool §3).
-    /// `DIVIDEND_INFLOW_BPS = 5000` (50% dari fee non-burn, `ADR-28`).
+    /// `DK-033/044` — documented constants (Spec Dividend Pool §3).
+    /// `DIVIDEND_INFLOW_BPS = 5000` (50% of the non-burned fee, `ADR-28`).
     pub const DIVIDEND_INFLOW_BPS: u128 = 5000;
-    /// `DIVIDEND_RATE_SCALE = 10^18` — hindari pembulatan merugikan pemain kecil.
+    /// `DIVIDEND_RATE_SCALE = 10^18` — avoids rounding that hurts small players.
     pub const DIVIDEND_RATE_SCALE: u128 = 1_000_000_000_000_000_000;
-    /// `MAX_DIVIDEND_CLAIM_EPOCHS = 8` — batas klaim mundur, selaras `MAX_GENERATION`.
+    /// `MAX_DIVIDEND_CLAIM_EPOCHS = 8` — the lookback claim limit, aligned with `MAX_GENERATION`.
     pub const MAX_DIVIDEND_CLAIM_EPOCHS: u64 = 8;
-    /// `MIN_AETHER_BURN = 1` — cegah spam 0-amount (keputusan tercatat: spec tidak ternominalisasi).
+    /// `MIN_AETHER_BURN = 1` — prevents 0-amount spam (recorded decision: not nominalized in the spec).
     pub const MIN_AETHER_BURN: u128 = 1;
     /// `EN-01` — `BASE_BURST_BPS = 200` (2%), selaras `REBATE_BPS` (Spec Enhancement §3.3).
     pub const BASE_BURST_BPS: u16 = 200;
     /// `EN-01` — `BURST_DURATION_EPOCHS = 1`.
     pub const BURST_DURATION_EPOCHS: u64 = 1;
-    /// `N141` — deposit storage minimum MVP = 5 milliNEAR (keputusan tercatat).
+    /// `N141` — the MVP minimum storage deposit = 5 milliNEAR (recorded decision).
     pub const STORAGE_DEPOSIT_MILLINEAR: u128 = 5;
-    /// `F5` Jalur 2 — kode error: target tidak berada di Tier 2 Chapter 11 Distressed
-    /// (`1 <= effective_vitality <= 2000`). Nama keputusan tercatat (spec tidak menamai).
+    /// `F5` Path 2 — error code: the target is not in the Tier 2 Chapter 11 Distressed
+    /// (`1 <= effective_vitality <= 2000`) window. A recorded-decision name (the spec does not name it).
     pub const ERR_NOT_DISTRESSED: &str = "ERR_NOT_DISTRESSED";
-    /// `F5` Jalur 2 — pembayaran buyout = `book_value × (10000 + HOSTILE_PREMIUM_BPS) / 10000`
+    /// `F5` Path 2 — the buyout payment = `book_value × (10000 + HOSTILE_PREMIUM_BPS) / 10000`
     /// (`ADR-26`: Book Value + 15% Restructuring Premium).
-    pub const HOSTILE_SELLER_BPS: u128 = 9500; // 95% pembayaran ke pemilik lama
-    pub const HOSTILE_TREASURY_BPS: u128 = 500; // 5% ke Rule-Bound Treasury
-    /// `F5` Jalur 2 — `floor_price` molekul belum ternominalisasi di spec → keputusan
-    /// tercatat: 1 unit `$SNACC` per unit molekul (transparan, mudah diganti).
+    pub const HOSTILE_SELLER_BPS: u128 = 9500; // 95% of the payment to the old owner
+    pub const HOSTILE_TREASURY_BPS: u128 = 500; // 5% to the Rule-Bound Treasury
+    /// `F5` Path 2 — the molecule `floor_price` is not nominalized in the spec → recorded
+    /// decision: 1 `$SNACC` unit per molecule unit (transparent, easy to change).
     pub const MOLECULE_FLOOR_PRICE: u128 = 1;
-    /// `EN-02`/`EN-105` — Great Feast (keputusan tercatat: target & band tidak
-    /// ternominalisasi di spec): target volume feed/epoch = 5% dari total supply,
-    /// band Goldilocks = ±20% dari target.
+    /// `EN-02`/`EN-105` — Great Feast (recorded decision: the target & band are not
+    /// nominalized in the spec): the target feed volume/epoch = 5% of the total supply,
+    /// the Goldilocks band = ±20% of the target.
     pub const FEAST_TARGET_BPS: u128 = 500;
     pub const FEAST_BAND_BPS: u128 = 2000;
-    /// `EN-108` — dormansi: tarif upkeep feed turun ke `UPKEEP_MIN_BPS` (`50` bps,
-    /// dari Peta Koneksi D7) saat `decayed_volume < ambang`. Ambang = keputusan
-    /// tercatat: 1% dari total supply (`DORMANCY_THRESHOLD_BPS`).
+    /// `EN-108` — dormancy: the feed upkeep rate drops to `UPKEEP_MIN_BPS` (`50` bps,
+    /// from the D7 Connection Map) when `decayed_volume < threshold`. The threshold = recorded
+    /// decision: 1% of the total supply (`DORMANCY_THRESHOLD_BPS`).
     pub const UPKEEP_MIN_BPS: u128 = 50;
     pub const DORMANCY_THRESHOLD_BPS: u64 = 100;
-    /// `EN-109` — rescue feeding (keputusan tercatat: linear; fee minimum `20%`
-    /// saat `effective_vitality -> 0`, penuh `100%` di `effective_vitality = 10000`).
+    /// `EN-109` — rescue feeding (recorded decision: linear; a minimum fee of `20%`
+    /// when `effective_vitality -> 0`, a full `100%` at `effective_vitality = 10000`).
     pub const RESCUE_MIN_FEE_BPS: u128 = 2000;
-    /// `EN-110` — matriks diet per kasta per zona (keputusan tercatat; arah dari
-    /// `LC-14`: Fever → Extractor murah, Famine → Synthesizer murah; lainnya 0).
+    /// `EN-110` — the per-caste per-zone diet matrix (recorded decision; direction from
+    /// `LC-14`: Fever → a cheaper Extractor, Famine → a cheaper Synthesizer; otherwise 0).
     pub const DIET_FEVER_EXTRACTOR_BPS: u16 = 2000;
     pub const DIET_FAMINE_SYNTHESIZER_BPS: u16 = 2000;
-    /// `EN-122`/`EN-124` — kode error pagar koloni (nama keputusan tercatat).
+    /// `EN-122`/`EN-124` — colony-fence error codes (recorded-decision names).
     pub const ERR_COLONY_FULL: &str = "ERR_COLONY_FULL";
     pub const ERR_MAX_GENERATION: &str = "ERR_MAX_GENERATION";
-    /// `ADR-30` — kode error NPC (keputusan tercatat; spec tidak menamai).
+    /// `ADR-30` — NPC error codes (recorded decision; the spec does not name them).
     pub const ERR_NPC_UNKNOWN: &str = "ERR_NPC_UNKNOWN";
     pub const ERR_NPC_OUT_OF_STOCK: &str = "ERR_NPC_OUT_OF_STOCK";
     pub const ERR_BAD_AMOUNT: &str = "ERR_BAD_AMOUNT";
-    /// `ADR-30`/`ECON-111` — harga dasar `P_base = 100` (§13a; final ECON-111:
-    /// `VOLUME_SCALE` menjadi satu-satunya knob kalibrasi).
+    /// `ADR-30`/`ECON-111` — the base price `P_base = 100` (§13a; final ECON-111:
+    /// `VOLUME_SCALE` is the only calibration knob).
     pub const P_BASE: u128 = 100;
-    /// Alias NPC (nama lama dipertahankan untuk pembacaan spec `ADR-30`).
+    /// NPC alias (the old name kept for readability against the `ADR-30` spec).
     pub const NPC_P_BASE: u128 = P_BASE;
-    /// `ECON-111` FINAL — `VOLUME_SCALE = 5`: pengali nilai $SNACC-ekuivalen per unit
-    /// molekul pada kaki K2/K3 `V_epoch` (econ-report-3 §1; supersede EN-117 "1000 sementara").
+    /// `ECON-111` FINAL — `VOLUME_SCALE = 5`: the $SNACC-equivalent value multiplier per molecule
+    /// unit on the K2/K3 legs of `V_epoch` (econ-report-3 §1; supersedes the EN-117 "1000 temporary").
     pub const VOLUME_SCALE: u128 = 5;
-    /// EN-119 (keputusan pemilik 2026-11-08) — Nukleus: output produksi
-    /// +`NUCLEUS_OUTPUT_BPS_PER_LEVEL` bps (10%)/level — mengalikan hasil `minted`
-    /// pada `transmute_spores_to_enzyme` & `synthesize_elixir`.
+    /// EN-119 (owner decision 2026-11-08) — Nucleus: production output
+    /// +`NUCLEUS_OUTPUT_BPS_PER_LEVEL` bps (10%)/level — multiplies the `minted` output
+    /// of `transmute_spores_to_enzyme` & `synthesize_elixir`.
     pub const NUCLEUS_OUTPUT_BPS_PER_LEVEL: u128 = 1000;
-    /// EN-119 — Lisosom: BMR −`LYSOSOME_BMR_BPS_PER_LEVEL` bps (10%)/level
-    /// (umur lebih panjang); BMR efektif = `bmr × (10000 − 1000×lisosom)/10000` (min 0).
+    /// EN-119 — Lysosome: BMR −`LYSOSOME_BMR_BPS_PER_LEVEL` bps (10%)/level
+    /// (longer lifespan); the effective BMR = `bmr × (10000 − 1000×lisosom)/10000` (min 0).
     pub const LYSOSOME_BMR_BPS_PER_LEVEL: u128 = 1000;
-    /// EN-117 (keputusan pemilik 2026-11-08 — suhu literal ATP): `V_epoch` =
-    /// kaki ekonomi + `atp_minted × ATP_VOLUME_SCALE`. Nilai dikalibrasi sweep
-    /// ECON-111 varian ATP (econ-report-4): `S_sim = 3000` → porsi ATP 37% dari
-    /// feed (share = S/(5100+S)); kontrak: share = S_c/(10^15+S_c) → S_c = 6×10^14
-    /// (feed 10^15 → 1 ATP → 6×10^14 volume). Fever 8,5%, populasi 73, solvent ✓.
+    /// EN-117 (owner decision 2026-11-08 — temperature is literal ATP): `V_epoch` =
+    /// the economic legs + `atp_minted × ATP_VOLUME_SCALE`. The value is calibrated by the
+    /// ECON-111 ATP-variant sweep (econ-report-4): `S_sim = 3000` → the ATP share is 37% of
+    /// the feed (share = S/(5100+S)); contract: share = S_c/(10^15+S_c) → S_c = 6×10^14
+    /// (a feed of 10^15 → 1 ATP → 6×10^14 volume). Fever 8.5%, population 73, solvent ✓.
     pub const ATP_VOLUME_SCALE: u128 = 600_000_000_000_000;
-    /// `EN-114`/§13a — ATP awal per Strain baru (energi kelahiran).
+    /// `EN-114`/§13a — the initial ATP per new Strain (birth energy).
     pub const INITIAL_ATP: u128 = 50;
-    /// `EN-114`/§13a — `0,001 NEAR katalis = 1 ATP` (unit yocto-scale fee).
+    /// `EN-114`/§13a — `0.001 NEAR catalyst = 1 ATP` (a yocto-scale fee unit).
     pub const ATP_YOCTO_UNIT: u128 = 1_000_000_000_000_000;
-    /// `EN-118`/§13a — level organel maksimum.
+    /// `EN-118`/§13a — the maximum organel level.
     pub const MAX_ORGANEL_LEVEL: u8 = 5;
-    /// `EN-114..118` — kode error (nama §13a/brief).
+    /// `EN-114..118` — error codes (§13a/brief names).
     pub const ERR_NOT_ENOUGH_ATP: &str = "ERR_NOT_ENOUGH_ATP";
-    /// Pipeline #5 — kode error baru (keputusan tercatat; spec tidak menamai).
+    /// Pipeline #5 — new error codes (recorded decision; the spec does not name them).
     pub const ERR_TRAIT_MISMATCH: &str = "ERR_TRAIT_MISMATCH";
     pub const ERR_BIRTHS_EXCEEDED: &str = "ERR_BIRTHS_EXCEEDED";
     pub const ERR_ALREADY_ALLOCATED: &str = "ERR_ALREADY_ALLOCATED";
     pub const ERR_ORGANEL_LEVEL_MAX: &str = "ERR_ORGANEL_LEVEL_MAX";
-    /// `ADR-30` — stok target NPC (keputusan tercatat; contoh tooltip Model Data memakai
-    /// 500/500): extractor baseline 500, central-arb inventori besar 1000, vulture 300.
+    /// `ADR-30` — NPC target stock (recorded decision; the Model Data tooltip example uses
+    /// 500/500): extractor baseline 500, central-arb a large inventory of 1000, vulture 300.
     pub const NPC_TARGET_EXTRACTOR: u64 = 500;
     pub const NPC_TARGET_CENTRAL_ARB: u64 = 1000;
     pub const NPC_TARGET_VULTURE: u64 = 300;
@@ -270,17 +270,17 @@ macro_rules! fail {
     };
 }
 
-/// Status solvabilitas — tangga 3 tingkat (`ADR-26`).
+/// Solvency status — a 3-rung ladder (`ADR-26`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub enum StrainStatus {
-    /// Tier 1: `effective_vitality > 2000` (>20%) — terlindungi penuh.
+    /// Tier 1: `effective_vitality > 2000` (>20%) — fully protected.
     Active,
-    /// Tier 2: `1..=2000` — jendela Chapter 11 (`hostile_takeover_splice` terbuka).
+    /// Tier 2: `1..=2000` — the Chapter 11 window (`hostile_takeover_splice` opens).
     Distressed,
-    /// Tier 3: `0` — Cell Lysis (`harvest_starving_strain` terbuka).
+    /// Tier 3: `0` — Cell Lysis (`harvest_starving_strain` opens).
     Liquidated,
-    /// `F5`: terserap habis oleh merger (`splice_strains`) — tidak dapat dipakai lagi.
+    /// `F5`: fully absorbed by a merger (`splice_strains`) — cannot be used again.
     SplicedBurned,
 }
 
@@ -290,14 +290,14 @@ pub enum StrainStatus {
 pub enum SolvencyTier {
     /// `> 2000` (>20%).
     Tier1Healthy,
-    /// `1..=2000` (1..20%) — terbuka untuk hostile takeover.
+    /// `1..=2000` (1..20%) — open to hostile takeover.
     Tier2Chapter11Distressed,
-    /// `0` — terbuka untuk `harvest_starving_strain`.
+    /// `0` — open to `harvest_starving_strain`.
     Tier3Chapter7Insolvent,
 }
 
-/// Kasta peran industri `Homunculus Strain` (`NEP-171`, `I-08`).
-/// Enum menjamin role tunggal saat Genesis; multi-bit hanya lewat `splice_strains`.
+/// The `Homunculus Strain` industrial role castes (`NEP-171`, `I-08`).
+/// The enum guarantees a single role at Genesis; multi-bit only via `splice_strains`.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StrainRole {
@@ -316,7 +316,7 @@ impl StrainRole {
         }
     }
 
-    /// `bmr_per_hour` awal per kasta (`F1`, `Katalog Molekul`): `100` / `120` / `150`.
+    /// Initial `bmr_per_hour` per caste (`F1`, `Katalog Molekul`): `100` / `120` / `150`.
     pub const fn bmr_per_hour(self) -> u64 {
         match self {
             StrainRole::Extractor => constants::BMR_EXTRACTOR_PER_HOUR,
@@ -326,52 +326,52 @@ impl StrainRole {
     }
 }
 
-/// Slot organel (`EN-07`): MVP 3 slot — alokasi `$ATP` 1× per epoch.
+/// Organel slots (`EN-07`): an MVP of 3 slots — `$ATP` allocation 1× per epoch.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct OrganelleSlots {
-    /// Mitokondria: menaikkan `atp_minted` (EN-06).
+    /// Mitochondria: raises `atp_minted` (EN-06).
     pub mitokondria: u8,
-    /// Nukleus: menaikkan ketahanan BMR.
+    /// Nucleus: raises BMR resilience.
     pub nukleus: u8,
-    /// Lisosom: memperbesar Nutrient Burst saat `snack`.
+    /// Lysosome: enlarges the Nutrient Burst on `snack`.
     pub lisosom: u8,
 }
 
-/// Profil Alkemis (`D1`).
+/// Alchemist profile (`D1`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlkemisProfile {
     pub account_id: AccountId,
-    /// Detik pertama kali onboarding (`incubate_strain`).
+    /// The second of first onboarding (`incubate_strain`).
     pub joined_sec: u64,
-    /// Jumlah Strain yang dimiliki (cache `get_colony`, `EN-08`).
+    /// The number of Strains owned (the `get_colony` cache, `EN-08`).
     pub strain_count: u8,
 }
 
-/// `StrainVessel` (`D2`) — neraca berdaulat satu `Homunculus Strain`.
+/// `StrainVessel` (`D2`) — the sovereign balance sheet of one `Homunculus Strain`.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrainVessel {
     pub strain_id: StrainId,
     pub owner_id: AccountId,
-    /// Keyless sub-account (`"keys": []`) penyimpan aset — `ADR-02`, `ADR-29`.
+    /// A keyless sub-account (`"keys": []`) holding the assets — `ADR-02`, `ADR-29`.
     pub vault_subaccount: AccountId,
-    /// Vitalitas (kanonik tangga: `0`, `1..=2000`, `>2000`).
+    /// Vitality (the canonical ladder: `0`, `1..=2000`, `>2000`).
     pub vitality: u64,
-    /// Efisiensi konversi `NEP-245` (`F2`): `10000 bps = 1.00x`.
+    /// The `NEP-245` conversion efficiency (`F2`): `10000 bps = 1.00x`.
     pub efficiency_bps: u16,
-    /// `BMR` — peluruhan vitalitas per jam (`ADR-22`).
+    /// `BMR` — vitality decay per hour (`ADR-22`).
     pub bmr_per_hour: u64,
-    /// Timestamp (detik) pemberian makan terakhir.
+    /// Timestamp (seconds) of the last feeding.
     pub last_fed_sec: u64,
     /// Bitmask Coasean (`ADR-25`): `ROLE_EXTRACTOR=0b001`, `ROLE_FERMENTER=0b010`, `ROLE_SYNTHESIZER=0b100`.
     pub role_mask: u8,
     /// Monotonic nonce anti-drain (`ADR-29`).
     pub state_nonce: u64,
-    /// Wajib `0` saat mutasi; dikunci saat cross-contract berjalan (`ADR-29`).
+    /// Must be `0` during a mutation; locked while a cross-contract call runs (`ADR-29`).
     pub pending_callbacks: u8,
-    /// Energi internal (`EN-06`) — **non-transferable, bukan token**, tanpa `total_supply`.
+    /// Internal energy (`EN-06`) — **non-transferable, not a token**, without a `total_supply`.
     pub atp_balance: u128,
     /// `F3` (`ADR-21`): komitmen `req_sha256_hex` Phase 1 (`commit_genome_experiment`).
     pub pending_commitment: Option<String>,
@@ -379,15 +379,15 @@ pub struct StrainVessel {
     pub phenotype_trait: Option<String>,
     /// Generasi hasil `splice_strains`/`divide_strain` (`EN-08`, maks `MAX_GENERATION`).
     pub generation: u8,
-    /// Set organel (`EN-07`); diwariskan saat merger = endosimbiosis (`EN-120`).
+    /// The organel set (`EN-07`); inherited on merger = endosymbiosis (`EN-120`).
     pub organel: OrganelleSlots,
-    /// `EN-118`/`EN-120` — epoch terakhir `allocate_atp` (1× per epoch); di-reset 0
-    /// pasca-merger agar realokasi ATP bisa dilakukan epoch yang sama (`EN-120`).
+    /// `EN-118`/`EN-120` — the last `allocate_atp` epoch (1× per epoch); reset to 0
+    /// after a merger so ATP reallocation can happen in the same epoch (`EN-120`).
     pub last_allocate_epoch: Epoch,
     pub status: StrainStatus,
 }
 
-/// Tampilan baca-saja `get_strain` (`F1`) — mirror `StrainVessel` + `effective_vitality(now)`.
+/// The read-only `get_strain` view (`F1`) — a `StrainVessel` mirror + `effective_vitality(now)`.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrainVesselView {
@@ -408,12 +408,12 @@ pub struct StrainVesselView {
     pub organel: OrganelleSlots,
     pub last_allocate_epoch: Epoch,
     pub status: StrainStatus,
-    /// Vitalitas efektif terhitung untuk `now` (Lazy BMR, `ADR-22`).
+    /// The effective vitality computed at `now` (Lazy BMR, `ADR-22`).
     pub effective_vitality: u64,
 }
 
 impl StrainVessel {
-    /// Bangun view untuk `now_sec` (detik).
+    /// Build the view for `now_sec` (seconds).
     pub fn to_view(&self, now_sec: u64) -> StrainVesselView {
         StrainVesselView {
             strain_id: self.strain_id,
@@ -437,10 +437,10 @@ impl StrainVessel {
         }
     }
 
-    /// Audit W10 — status untuk view: status tersimpan `Active` diturunkan ke
-    /// `Distressed` saat `1 <= effective_vitality <= 2000` (Tier 2, Lazy BMR —
-    /// status dihitung di view, tanpa keeper). Tier 3 (`0`) tetap `Active` sampai
-    /// `harvest_starving_strain` (→ `Liquidated`); gunakan `get_solvency_tier`.
+    /// Audit W10 — the status for views: a stored `Active` status downgrades to
+    /// `Distressed` when `1 <= effective_vitality <= 2000` (Tier 2, Lazy BMR —
+    /// the status is computed in the view, keeperless). Tier 3 (`0`) stays `Active` until
+    /// `harvest_starving_strain` (→ `Liquidated`); use `get_solvency_tier`.
     pub fn view_status(&self, now_sec: u64) -> StrainStatus {
         match self.status {
             StrainStatus::Active if (1..=2000).contains(&self.effective_vitality(now_sec)) => {
@@ -475,8 +475,8 @@ impl StrainVessel {
             .saturating_sub(elapsed_hours.saturating_mul(bmr_eff))
     }
 
-    /// Pengunci mutasi saldo/inventori (`ADR-29`) — tolak bila ada async berjalan
-    /// atau nonce berubah (serangan `ERC-6551` seller-drain).
+    /// The balance/inventory mutation lock (`ADR-29`) — rejects when an async call is running
+    /// or the nonce changed (the `ERC-6551` seller-drain attack).
     pub fn assert_atomic_ready(&self, expected_nonce: u64) {
         assert_eq!(
             self.pending_callbacks, 0,
@@ -488,13 +488,13 @@ impl StrainVessel {
         );
     }
 
-    /// Setiap mutasi saldo `$SNACC`/inventori `NEP-245` menaikkan nonce (`ADR-29`).
+    /// Every `$SNACC` balance/`NEP-245` inventory mutation bumps the nonce (`ADR-29`).
     pub fn record_mutation(&mut self) {
         self.state_nonce = self.state_nonce.saturating_add(1);
     }
 }
 
-/// Zona makro (`EN-106`) — disimpan untuk deteksi transisi `zone_changed`.
+/// Macro zone (`EN-106`) — stored for `zone_changed` transition detection.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum MacroZone {
@@ -514,7 +514,7 @@ impl MacroZone {
     }
 }
 
-/// Parameter termostat moneter (`D7`) — semua nilai mengikuti Kamus Angka Resmi.
+/// Monetary thermostat parameters (`D7`) — every value follows the Kamus Angka Resmi.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TermostatParams {
@@ -525,7 +525,7 @@ pub struct TermostatParams {
     pub max_epoch_treasury_drain_bps: u16,
     pub volume_decay_per_sec: u64,
     pub max_shift_bps: u16,
-    /// `EN-108` — ambang dormansi (`%` supply × 100): dormansi saat
+    /// `EN-108` — the dormancy threshold (`%` of supply × 100): dormant when
     /// `decayed_volume < supply × dormancy_threshold_bps / 10000`.
     pub dormancy_threshold_bps: u64,
 }
@@ -546,56 +546,56 @@ impl Default for TermostatParams {
     }
 }
 
-/// `MacroState` (`D7`) — state makro `CrucibleTemp` + Nutrient Burst + dividen.
+/// `MacroState` (`D7`) — the `CrucibleTemp` macro state + Nutrient Burst + dividends.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroState {
     pub current_epoch: Epoch,
-    /// Audit W6 — epoch berjalan baru boleh ditutup saat `now_sec() >= epoch_ends_sec`.
+    /// Audit W6 — the running epoch may only be closed when `now_sec() >= epoch_ends_sec`.
     pub epoch_ends_sec: u64,
-    /// Timestamp blok (ms) pembaruan terakhir — **dari `env::block_timestamp_ms()`** (`V-02`).
+    /// Block timestamp (ms) of the last update — **from `env::block_timestamp_ms()`** (`V-02`).
     pub last_update_ms: u64,
-    /// `V_epoch` — volume aktivitas ter-decay untuk `CrucibleTemp = 1000 × V / M_supply`.
+    /// `V_epoch` — the decayed activity volume for `CrucibleTemp = 1000 × V / M_supply`.
     pub volume_epoch: u128,
-    /// Total suplai `$SNACC` beredar (`I-01`, bertambah saat `incubate_strain`, berkurang saat burn).
+    /// The circulating `$SNACC` total supply (`I-01`, grows on `incubate_strain`, shrinks on burn).
     pub total_snacc_supply: u128,
-    /// Akumulasi `$SNACC` yang dibakar (`I-01`, Fever burn + `ft_burn`).
+    /// The accumulated burned `$SNACC` (`I-01`, Fever burn + `ft_burn`).
     pub total_snacc_burned: u128,
-    /// Akumulasi subsidi treasury pada epoch berjalan (`I-04`).
+    /// The accumulated treasury subsidy of the running epoch (`I-04`).
     pub epoch_treasury_spent: u128,
-    /// Snapshot saldo treasury di awal epoch untuk batas subsidi `500 bps` (`I-04`).
+    /// A snapshot of the treasury balance at epoch start for the `500 bps` subsidy cap (`I-04`).
     pub epoch_treasury_initial: u128,
     /// Diskon feed aktif (`EN-01`, `0..=MAX_BURST_BPS`).
     pub nutrient_burst_bps: u16,
-    /// Epoch berakhirnya burst (`EN-01`).
+    /// The epoch where the burst ends (`EN-01`).
     pub nutrient_burst_until: Epoch,
     /// `industrial_dividend_pool` (`DK-033`) — akumulasi 50% fee non-burn.
     pub industrial_dividend_pool: u128,
-    /// Inflow dividen epoch berjalan (`DK-033`).
+    /// The running epoch's dividend inflow (`DK-033`).
     pub epoch_dividend_inflow: u128,
-    /// Total `mt:elixir-aether` terbakar epoch berjalan (`DK-044`).
+    /// The total `mt:elixir-aether` burned in the running epoch (`DK-044`).
     pub epoch_aether_burned_total: u128,
-    /// Epoch terakhir yang ditutup (`advance_epoch`, `DK-033`).
+    /// The last closed epoch (`advance_epoch`, `DK-033`).
     pub last_closed_epoch: Epoch,
-    /// `EN-105` — akumulasi volume feed (`effective_fee` `feed_strain`) epoch berjalan.
+    /// `EN-105` — the running epoch's accumulated feed volume (`effective_fee` of `feed_strain`).
     pub epoch_feast_volume: u128,
-    /// `EN-106` — zona makro terakhir yang terdeteksi (untuk event `zone_changed`).
+    /// `EN-106` — the last detected macro zone (for the `zone_changed` event).
     pub last_zone: MacroZone,
-    /// `EN-104` — akumulasi diskon burst yang sudah diberikan epoch berjalan
-    /// (cap bersama kuota `I-04` = 5% Pantry/epoch; anti-boros treasury).
+    /// `EN-104` — the burst discount already granted in the running epoch
+    /// (capped together with the `I-04` quota = 5% Pantry/epoch; protects the treasury from waste).
     pub epoch_burst_discount_granted: u128,
-    /// Pipeline #6 — pembukuan agregat untuk invarian `V-04` (`get_global_solvency`):
-    /// LookupMap tidak bisa diiterasi, maka agregat dipelihara inkremental oleh
-    /// helper `set_strain_snacc`/`set_account_balance` (satu-satunya jalur tulis ledger).
+    /// Pipeline #6 — aggregate bookkeeping for the `V-04` invariant (`get_global_solvency`):
+    /// LookupMap cannot be iterated, so the aggregates are maintained incrementally by
+    /// the `set_strain_snacc`/`set_account_balance` helpers (the only ledger write paths).
     pub sum_strain_snacc: u128,
     pub sum_account_balances: u128,
     pub sum_npc_reserve: u128,
-    /// Pipeline #6 — akumulasi katalis fee (NEAR-yocto, inflow eksternal) yang masuk
-    /// bucket treasury/pool — sisi pemasukan invarian di luar minted `$SNACC`.
+    /// Pipeline #6 — the accumulated catalyst fees (NEAR-yocto, external inflow) entering
+    /// the treasury/pool buckets — the invariant's income side beyond minted `$SNACC`.
     pub total_catalyst_fees: u128,
-    /// `EN-124` — counter demografi (D6): births = inkubasi + divide;
-    /// mergers = splice + hostile; lyses = harvest. `total_divides` = pembukuan
-    /// turunan (bagian births dari divide) untuk gate invariant.
+    /// `EN-124` — demographics counters (D6): births = incubation + divide;
+    /// mergers = splice + hostile; lyses = harvest. `total_divides` = the derived
+    /// bookkeeping (the births share of divide) for the invariant gate.
     pub total_births: u128,
     pub total_mergers: u128,
     pub total_lyses: u128,
@@ -636,12 +636,12 @@ impl Default for MacroState {
     }
 }
 
-/// Tampilan baca-saja `get_macro_state` (`F4`, `VC-005`) — mirror `MacroState` + `crucible_temp`.
+/// The read-only `get_macro_state` view (`F4`, `VC-005`) — a `MacroState` mirror + `crucible_temp`.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroStateView {
     pub current_epoch: Epoch,
-    /// Audit W6 — epoch berjalan baru boleh ditutup saat `now_sec() >= epoch_ends_sec`.
+    /// Audit W6 — the running epoch may only be closed when `now_sec() >= epoch_ends_sec`.
     pub epoch_ends_sec: u64,
     pub last_update_ms: u64,
     pub volume_epoch: u128,
@@ -655,24 +655,24 @@ pub struct MacroStateView {
     pub epoch_dividend_inflow: u128,
     pub epoch_aether_burned_total: u128,
     pub last_closed_epoch: Epoch,
-    /// `EN-105` — akumulasi volume feed epoch berjalan (mirror `MacroState`).
+    /// `EN-105` — the running epoch's accumulated feed volume (mirror of `MacroState`).
     pub epoch_feast_volume: u128,
-    /// `EN-106` — zona makro terakhir (mirror).
+    /// `EN-106` — the last macro zone (mirror).
     pub last_zone: MacroZone,
-    /// `EN-104` — akumulasi diskon burst epoch berjalan (mirror `MacroState`).
+    /// `EN-104` — the running epoch's burst discount accumulator (mirror of `MacroState`).
     pub epoch_burst_discount_granted: u128,
-    /// Pipeline #6 — pembukuan agregat (mirror) + drift `V-04`.
+    /// Pipeline #6 — the aggregate bookkeeping (mirror) + the `V-04` drift.
     pub sum_strain_snacc: u128,
     pub sum_account_balances: u128,
     pub sum_npc_reserve: u128,
     pub total_catalyst_fees: u128,
-    /// `EN-124` — counter demografi (mirror).
+    /// `EN-124` — demographics counters (mirror).
     pub total_births: u128,
     pub total_mergers: u128,
     pub total_lyses: u128,
     pub total_divides: u128,
     pub params: TermostatParams,
-    /// Suhu makro terhitung (`mK`, lazy decay tanpa cron — `ADR-04`).
+    /// The computed macro temperature (`mK`, cron-free lazy decay — `ADR-04`).
     pub crucible_temp: u64,
 }
 
@@ -693,15 +693,15 @@ impl MacroState {
     pub fn crucible_temp_at(&self, now_ms: u64) -> u64 {
         let v_decayed = self.decayed_volume(now_ms);
         let denom = std::cmp::max(self.total_snacc_supply, 1);
-        // DK-026 — suhu = 1000 × (V/M): rasio VELOCITY, invarian satuan — V dan M
-        // sama-sama yocto, jadi aktivitas proporsional (V = c×M) menghasilkan suhu
-        // yang sama di supply 10^18..10^30 yocto (property test qa_dk026_*).
-        // Saturating + clamp u64: tanpa wrap di skala ekstrem.
+        // DK-026 — temperature = 1000 × (V/M): a VELOCITY ratio, unit-invariant — V and M
+        // are both in yocto, so proportional activity (V = c×M) yields the same temperature
+        // across supplies of 10^18..10^30 yocto (property test qa_dk026_*).
+        // Saturating + a u64 clamp: no wrap at extreme scales.
         let t = v_decayed.saturating_mul(1000) / denom;
         t.min(u64::MAX as u128) as u64
     }
 
-    /// Bangun `MacroStateView` dengan `crucible_temp` pada `now_ms`.
+    /// Build the `MacroStateView` with `crucible_temp` at `now_ms`.
     pub fn to_view(&self, now_ms: u64) -> MacroStateView {
         MacroStateView {
             current_epoch: self.current_epoch,
@@ -734,8 +734,8 @@ impl MacroState {
         }
     }
 
-    /// Burst aktif hanya dalam `nutrient_burst_until` epoch (kedaluwarsa otomatis
-    /// saat berganti epoch, tanpa keeper — `ADR-27`, spec EN-01 §3.2).
+    /// The burst is active only before the `nutrient_burst_until` epoch (expires automatically
+    /// when the epoch changes, keeperless — `ADR-27`, spec EN-01 §3.2).
     pub fn active_burst_bps(&self, epoch: Epoch) -> u16 {
         if epoch < self.nutrient_burst_until {
             self.nutrient_burst_bps
@@ -745,7 +745,7 @@ impl MacroState {
     }
 }
 
-/// `EN-107` — entri leaderboard feeder (Great Feast; maksimal 3 per epoch).
+/// `EN-107` — a feeder leaderboard entry (Great Feast; at most 3 per epoch).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeederEntry {
@@ -753,7 +753,7 @@ pub struct FeederEntry {
     pub amount: u128,
 }
 
-/// Metadata `NEP-177` (subset yang dibutuhkan wallet: title/description/media).
+/// `NEP-177` metadata (the subset wallets need: title/description/media).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct NftMetadataView {
@@ -772,7 +772,7 @@ pub struct NftTokenView {
     pub metadata: NftMetadataView,
 }
 
-/// Agen Pedagang & Arbitraseur NPC Otonom On-Chain (`D4` / `ADR-30`).
+/// On-chain autonomous NPC merchant & arbitrageur agents (`D4` / `ADR-30`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct NpcMerchantAgent {
@@ -786,7 +786,7 @@ pub struct NpcMerchantAgent {
     pub trades_executed: u64,
 }
 
-/// Output kuotasi NPC on-chain + reasoning tooltip (`ADR-30`, Model Data — serialisasi json).
+/// The on-chain NPC quote output + reasoning tooltip (`ADR-30`, Model Data — json serialization).
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct NpcQuoteView {
@@ -798,7 +798,7 @@ pub struct NpcQuoteView {
     pub reasoning_tooltip: String,
 }
 
-/// Bukti attestation TEE (`D5`) — disimpan dari `apply_tee_mutation_zero_trust` (`ADR-21`).
+/// TEE attestation proof (`D5`) — stored from `apply_tee_mutation_zero_trust` (`ADR-21`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeeAttestation {
@@ -806,11 +806,11 @@ pub struct TeeAttestation {
     pub model: String,
     pub req_sha256_hex: String,
     pub res_sha256_hex: String,
-    /// Pubkey ed25519 enclave (hex) yang diverifikasi via `env::ed25519_verify`.
+    /// The enclave's ed25519 pubkey (hex), verified via `env::ed25519_verify`.
     pub signer_pubkey_hex: String,
 }
 
-/// Log M&A & Likuidasi (`D8`).
+/// M&A & liquidation log (`D8`).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MnaLogEntry {
@@ -881,9 +881,9 @@ mod tests {
     }
 
     #[test]
-    fn vc002_kamus_angka_terkunci() {
+    fn vc002_locked_reference_numbers() {
         let p = TermostatParams::default();
-        // ECON-111 FINAL (keputusan pemilik 2026-11-08): Fever >610 mK (supersede 1400).
+        // ECON-111 FINAL (owner decision 2026-11-08): Fever >610 mK (supersedes 1400).
         assert_eq!(p.fever_threshold_mk, 610);
         assert_eq!(p.hypothermia_threshold_mk, 600);
         assert_eq!(p.fever_burn_bps, 350);
@@ -900,14 +900,14 @@ mod tests {
 
     #[test]
     fn vc002_lazy_bmr_effective_vitality() {
-        let v = sample_strain(); // last_fed 3600, bmr 100/jam
+        let v = sample_strain(); // last_fed 3600, bmr 100/h
         assert_eq!(v.effective_vitality(3600), 2500);
-        assert_eq!(v.effective_vitality(3600 + 5 * 3600), 2000); // 5 jam × 100
-        assert_eq!(v.effective_vitality(3600 + 100 * 3600), 0); // saturasi ke 0
+        assert_eq!(v.effective_vitality(3600 + 5 * 3600), 2000); // 5 hours × 100
+        assert_eq!(v.effective_vitality(3600 + 100 * 3600), 0); // saturates to 0
     }
 
     #[test]
-    fn vc002_record_mutation_naikkan_nonce() {
+    fn vc002_record_mutation_bumps_nonce() {
         let mut v = sample_strain();
         v.record_mutation();
         assert_eq!(v.state_nonce, 8);
@@ -915,14 +915,14 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED")]
-    fn vc002_nonce_mismatch_ditolak() {
+    fn vc002_nonce_mismatch_rejected() {
         let v = sample_strain();
         v.assert_atomic_ready(99);
     }
 
     #[test]
     #[should_panic(expected = "ERR_PENDING_ASYNC_CALLBACK_LOCKED")]
-    fn vc002_pending_callback_mengunci() {
+    fn vc002_pending_callback_locks() {
         let mut v = sample_strain();
         v.pending_callbacks = 1;
         v.assert_atomic_ready(7);

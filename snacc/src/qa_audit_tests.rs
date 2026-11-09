@@ -1,7 +1,7 @@
-//! Audit kelengkapan 2026-11-08 (W4–W10) — test perbaikan kontrak.
-//! Mandiri (helpers lokal `ctx`/`baru` — pola qa_f1_tests).
+//! Contract-fix test suite from the 2026-11-08 completeness audit (W4–W10).
+//! Self-contained (local `ctx`/`baru` helpers — the qa_f1_tests pattern).
 #[cfg(test)]
-#[allow(clippy::module_inception)] // nama modul = nama file qa_*
+#[allow(clippy::module_inception)] // module name = file name qa_*
 mod qa_audit_tests {
     use crate::state::constants;
     use crate::state::StrainRole;
@@ -31,7 +31,7 @@ mod qa_audit_tests {
     fn ctx(predecessor: &str, deposit_yocto: u128, ts_sec: u64) {
         ctx_on("snacc-v001.testnet", predecessor, deposit_yocto, ts_sec);
     }
-    /// Kontrak baru (owner = `OWNER`) + satu strain ber-stake NEAR.
+    /// A fresh contract (owner = `OWNER`) + one NEAR-staked strain.
     fn baru(stake: u128, role: StrainRole, spores: u64) -> (SnaccContract, StrainId) {
         ctx(OWNER, stake, T0);
         let mut c = SnaccContract::new();
@@ -43,11 +43,11 @@ mod qa_audit_tests {
     // W9 — `advance_sandbox_clock` (ADR-22) + `now_sec()` tunggal
     // ------------------------------------------------------------------
 
-    /// Owner memajukan jam 48 jam → BMR/aging ikut (Extractor 100/jam).
+    /// The owner advances the clock 48 hours → BMR/aging follow (Extractor 100/h).
     #[test]
-    fn w9_sandbox_clock_memajukan_aging() {
+    fn w9_sandbox_clock_advances_aging() {
         let (mut c, id) = baru(10_000, StrainRole::Extractor, 0);
-        assert!(c.sandbox_clock_enabled, "akun .testnet = mode sandbox");
+        assert!(c.sandbox_clock_enabled, "a .testnet account = sandbox mode");
         assert_eq!(c.get_strain(id).effective_vitality, 8500);
         ctx(OWNER, 0, T0);
         assert_eq!(c.advance_sandbox_clock(48), 48 * 3600);
@@ -58,9 +58,9 @@ mod qa_audit_tests {
         assert_eq!(now, T0 + 48 * 3600);
     }
 
-    /// Tier 2 → hostile terbuka, Tier 3 → lisis terbuka tanpa menunggu jam nyata.
+    /// Tier 2 → hostile opens, Tier 3 → lysis opens without waiting for real time.
     #[test]
-    fn w9_sandbox_clock_membuka_tier2_dan_lisis() {
+    fn w9_sandbox_clock_opens_tier2_and_lysis() {
         let (mut c, id) = baru(10_000, StrainRole::Extractor, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(70); // 8500 - 7000 = 1500 → Tier 2
@@ -74,23 +74,23 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_NOT_CONTRACT_OWNER")]
-    fn w9_sandbox_clock_bukan_owner_ditolak() {
+    fn w9_sandbox_clock_non_owner_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(LAIN, 0, T0);
         let _ = c.advance_sandbox_clock(1);
     }
 
-    /// Akun mainnet (`.near`) → flag mati sejak init; tak ada setter.
+    /// A mainnet account (`.near`) → the flag is off since init; no setter.
     #[test]
     #[should_panic(expected = "ERR_SANDBOX_CLOCK_DISABLED")]
-    fn w9_sandbox_clock_mati_di_mainnet() {
+    fn w9_sandbox_clock_off_on_mainnet() {
         ctx_on("snacc-v001.near", OWNER, 0, T0);
         let mut c = SnaccContract::new();
         assert!(!c.sandbox_clock_enabled);
         let _ = c.advance_sandbox_clock(1);
     }
 
-    /// `migrate()` di akun mainnet juga mematikan flag.
+    /// `migrate()` on a mainnet account also turns the flag off.
     #[test]
     fn w9_migrate_mainnet_flag_mati_testnet_hidup() {
         ctx_on("snacc-v001.near", "snacc-v001.near", 0, T0);
@@ -103,7 +103,7 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_BAD_AMOUNT")]
-    fn w9_sandbox_clock_nol_jam_ditolak() {
+    fn w9_sandbox_clock_zero_hours_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(0);
@@ -111,19 +111,19 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_BAD_AMOUNT")]
-    fn w9_sandbox_clock_melebihi_batas_ditolak() {
+    fn w9_sandbox_clock_over_limit_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(constants::MAX_SANDBOX_ADVANCE_HOURS + 1);
     }
 
     // ------------------------------------------------------------------
-    // W4 — cek pemilik pada produksi (V-01, ERR_NOT_STRAIN_OWNER)
+    // W4 — owner checks on the production paths (V-01, ERR_NOT_STRAIN_OWNER)
     // ------------------------------------------------------------------
 
     #[test]
     #[should_panic(expected = "ERR_NOT_STRAIN_OWNER")]
-    fn w4_extract_bukan_pemilik_ditolak() {
+    fn w4_extract_non_owner_rejected() {
         let (mut c, id) = baru(10_000, StrainRole::Extractor, 0);
         ctx(LAIN, 0, T0);
         let _ = c.extract_spores(id, "mt:spore-ignis".to_string(), U128(0));
@@ -131,7 +131,7 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_NOT_STRAIN_OWNER")]
-    fn w4_transmute_bukan_pemilik_ditolak() {
+    fn w4_transmute_non_owner_rejected() {
         let (mut c, id) = baru(10_000, StrainRole::Fermenter, 0);
         let _ = c.inventories.insert((id, "mt:spore-ignis".to_string()), 4);
         ctx(LAIN, 0, T0);
@@ -140,7 +140,7 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_NOT_STRAIN_OWNER")]
-    fn w4_synthesize_bukan_pemilik_ditolak() {
+    fn w4_synthesize_non_owner_rejected() {
         let (mut c, id) = baru(10_000, StrainRole::Synthesizer, 0);
         let _ = c.inventories.insert((id, constants::ENZYME_AMALGAM.to_string()), 4);
         let _ = c.inventories.insert((id, constants::ENZYME_SYNTHASE.to_string()), 4);
@@ -148,9 +148,9 @@ mod qa_audit_tests {
         let _ = c.synthesize_elixir(id, constants::ELIXIR_HOMUNCULUS.to_string(), 3, U128(0));
     }
 
-    /// Pemilik tetap bisa (regresi positif) dan ATP korban tidak tersentuh oleh akun lain.
+    /// The owner still can (positive regression) and the victim's ATP is untouched by other accounts.
     #[test]
-    fn w4_pemilik_tetap_bisa_extract() {
+    fn w4_owner_still_can_extract() {
         let (mut c, id) = baru(10_000, StrainRole::Extractor, 0);
         let atp0 = c.get_strain(id).atp_balance;
         ctx(OWNER, 0, T0);
@@ -162,10 +162,10 @@ mod qa_audit_tests {
     // W5 — tutup mint gratis `incubate_strain` (I-01) + W7 onboarding
     // ------------------------------------------------------------------
 
-    /// Deposit 0 + stake N tanpa saldo akun → ditolak; supply tidak berubah.
+    /// Deposit 0 + stake N without an account balance → rejected; supply unchanged.
     #[test]
     #[should_panic(expected = "ERR_INSUFFICIENT_BALANCE")]
-    fn w5_stake_tanpa_deposit_tanpa_saldo_ditolak() {
+    fn w5_stake_without_deposit_without_balance_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(LAIN, 0, T0);
         let _ = c.incubate_strain(StrainRole::Extractor, U128(10u128.pow(24)), 0);
@@ -173,7 +173,7 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_INSUFFICIENT_DEPOSIT")]
-    fn w5_stake_nol_deposit_nol_ditolak() {
+    fn w5_stake_zero_deposit_zero_rejected() {
         ctx(OWNER, 0, T0);
         let mut c = SnaccContract::new();
         let _ = c.incubate_strain(StrainRole::Extractor, U128(0), 0);
@@ -181,32 +181,32 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_STAKE_DEPOSIT_MISMATCH")]
-    fn w5_deposit_beda_dengan_stake_ditolak() {
+    fn w5_deposit_differs_from_stake_rejected() {
         ctx(OWNER, 5_000, T0);
         let mut c = SnaccContract::new();
         let _ = c.incubate_strain(StrainRole::Extractor, U128(10_000), 0);
     }
 
-    /// W7 — pemain baru hanya punya NEAR: hatch ber-deposit = jalur onboarding;
-    /// suplai lahir = deposit, 80% ke strain, bisa langsung `feed_strain`; V-04 solvent.
+    /// W7 — a new player only holds NEAR: hatching with a deposit = the onboarding path;
+    /// the born supply = the deposit, 80% to the strain, can immediately `feed_strain`; V-04 solvent.
     #[test]
-    fn w7_onboarding_pemain_baru_dengan_near() {
+    fn w7_onboarding_new_player_with_near() {
         ctx(OWNER, 0, T0);
         let mut c = SnaccContract::new();
         let stake = 10u128.pow(24);
-        ctx("pemain-baru.testnet", stake, T0);
+        ctx("new-player.testnet", stake, T0);
         let v = c.incubate_strain(StrainRole::Fermenter, U128(0), 2);
         assert_eq!(c.ft_total_supply().0, stake);
         assert_eq!(c.snacc_balances.get(&v.strain_id).copied(), Some(stake * 8 / 10));
-        ctx("pemain-baru.testnet", 0, T0);
+        ctx("new-player.testnet", 0, T0);
         let _ = c.feed_strain(v.strain_id, U128(10u128.pow(21)));
         assert!(c.get_global_solvency().solvent);
     }
 
-    /// Stake dari saldo akun (bounty lisis) → supply TIDAK bertambah; saldo akun
-    /// didebit; invarian V-04 tetap solvent di semua jalur.
+    /// A stake from the account balance (a lysis bounty) → the supply does NOT grow; the account
+    /// balance is debited; the V-04 invariant stays solvent on every path.
     #[test]
-    fn w5_stake_dari_saldo_akun_tanpa_mint() {
+    fn w5_stake_from_account_balance_without_mint() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(100); // eff 0 → Tier 3
@@ -218,7 +218,7 @@ mod qa_audit_tests {
         assert!(c.get_global_solvency().solvent);
 
         let v = c.incubate_strain(StrainRole::Synthesizer, bounty, 0);
-        assert_eq!(c.ft_total_supply().0, supply0, "tanpa mint baru");
+        assert_eq!(c.ft_total_supply().0, supply0, "no new mint");
         assert_eq!(c.ft_balance_of(akun(LAIN)).0, 0);
         let to_treasury = bounty.0 * 2000 / 10_000;
         assert_eq!(
@@ -229,20 +229,20 @@ mod qa_audit_tests {
     }
 
     // ------------------------------------------------------------------
-    // W6 — gerbang waktu `advance_epoch`
+    // W6 — the `advance_epoch` time gate
     // ------------------------------------------------------------------
 
     #[test]
     #[should_panic(expected = "ERR_EPOCH_NOT_ENDED")]
-    fn w6_advance_epoch_sebelum_berakhir_ditolak() {
+    fn w6_advance_epoch_before_end_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(LAIN, 0, T0 + constants::EPOCH_DURATION_SEC - 1);
         c.advance_epoch();
     }
 
-    /// Tepat di batas → lolos; panggilan kedua di blok yang sama → ditolak (anti-spam).
+    /// Exactly at the boundary → passes; a second call in the same block → rejected (anti-spam).
     #[test]
-    fn w6_advance_epoch_setelah_berakhir_lalu_spam_ditolak() {
+    fn w6_advance_epoch_after_end_then_spam_rejected() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         let t1 = T0 + constants::EPOCH_DURATION_SEC;
         ctx(LAIN, 0, t1);
@@ -253,9 +253,9 @@ mod qa_audit_tests {
         assert!(spam.is_err());
     }
 
-    /// Jam sandbox (ADR-22) ikut membuka gerbang epoch.
+    /// The sandbox clock (ADR-22) also opens the epoch gate.
     #[test]
-    fn w6_advance_epoch_lewat_sandbox_clock() {
+    fn w6_advance_epoch_via_sandbox_clock() {
         let (mut c, _) = baru(10_000, StrainRole::Extractor, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(constants::EPOCH_DURATION_SEC / 3600);
@@ -265,7 +265,7 @@ mod qa_audit_tests {
     }
 
     // ------------------------------------------------------------------
-    // Dividen — overflow u128 `inflow × 1e18` di advance_epoch (bug live)
+    // Dividends — the u128 `inflow × 1e18` overflow in advance_epoch (a live bug)
     // ------------------------------------------------------------------
 
     #[test]
@@ -279,10 +279,10 @@ mod qa_audit_tests {
         assert_eq!(mul_div_u128(1, 1, 0), 0);
     }
 
-    /// Inflow 1e21..1e30 (live: 3.537e23) → epoch tertutup + klaim end-to-end
-    /// membayar seluruh inflow ke penyumbang tunggal; V-04 solvent.
+    /// An inflow of 1e21..1e30 (live: 3.537e23) → a closed epoch + an end-to-end claim
+    /// paying the whole inflow to the single contributor; V-04 solvent.
     #[test]
-    fn div_inflow_besar_epoch_tertutup_dan_klaim() {
+    fn div_large_inflow_closed_epoch_and_claim() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Synthesizer, 0);
         for (epoch, exp) in [21u32, 23, 24, 27, 30].into_iter().enumerate() {
             let _ = c
@@ -290,12 +290,12 @@ mod qa_audit_tests {
                 .insert((id, constants::ELIXIR_AETHER.to_string()), 3);
             ctx(OWNER, 0, T0);
             c.synthesize_and_redeem_aether(id, U128(2));
-            // Simulasikan inflow besar (dicatat sebagai suplai beredar → V-04 seimbang).
+            // Simulate a large inflow (recorded as circulating supply → V-04 stays balanced).
             let inflow = 10u128.pow(exp);
             c.macro_state.total_snacc_supply += inflow;
             c.macro_state.epoch_dividend_inflow += inflow;
-            c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
-            c.advance_epoch(); // dulu: panic overflow
+            c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
+            c.advance_epoch(); // previously: an overflow panic
             let payout = c.claim_industrial_dividend(id, epoch as u64);
             assert_eq!(payout.0, inflow, "exp={exp}");
             assert!(c.get_global_solvency().solvent, "exp={exp}");
@@ -303,10 +303,10 @@ mod qa_audit_tests {
     }
 
     // ------------------------------------------------------------------
-    // W10 — lifecycle: splice BMR −15%, status dominan, MAX_GENERATION, Distressed
+    // W10 — lifecycle: splice BMR −15%, the dominant's status, MAX_GENERATION, Distressed
     // ------------------------------------------------------------------
 
-    /// Dua strain milik OWNER (dom Synthesizer BMR 150, abs Extractor).
+    /// Two strains owned by OWNER (dom Synthesizer BMR 150, abs Extractor).
     fn dua_strain() -> (SnaccContract, StrainId, StrainId) {
         let (mut c, dom) = baru(10_000, StrainRole::Synthesizer, 0);
         ctx(OWNER, 10_000, T0);
@@ -315,34 +315,34 @@ mod qa_audit_tests {
     }
 
     #[test]
-    fn w10_splice_bmr_turun_15_persen_dan_vitalitas_disettle() {
+    fn w10_splice_bmr_down_15_percent_and_vitality_settled() {
         let (mut c, dom, abs) = dua_strain();
-        ctx(OWNER, 0, T0 + 10 * 3600); // 10 jam: dom eff = 8500 - 10×150 = 7000
+        ctx(OWNER, 0, T0 + 10 * 3600); // 10 h: dom eff = 8500 - 10×150 = 7000
         let v = c.splice_strains(dom, abs);
         assert_eq!(v.bmr_per_hour, 150 * 8500 / 10_000); // 127
-        assert_eq!(v.vitality, 7000, "settle ke now sebelum BMR baru");
+        assert_eq!(v.vitality, 7000, "settled to now before the new BMR");
         assert_eq!(v.last_fed_sec, T0 + 10 * 3600);
         assert_eq!(v.effective_vitality, 7000);
         assert_eq!(v.generation, 1);
-        // BMR baru berlaku ke depan: +10 jam → 7000 - 10×127.
+        // The new BMR applies going forward: +10 hours → 7000 - 10×127.
         ctx(OWNER, 0, T0 + 20 * 3600);
         assert_eq!(c.get_strain(dom).effective_vitality, 7000 - 10 * 127);
     }
 
     #[test]
     #[should_panic(expected = "ERR_STRAIN_ALREADY_SPLICED")]
-    fn w10_splice_dominan_sudah_terserap_ditolak() {
+    fn w10_splice_dominant_already_absorbed_rejected() {
         let (mut c, dom, abs) = dua_strain();
         ctx(OWNER, 10_000, T0);
         let ketiga = c.incubate_strain(StrainRole::Fermenter, U128(0), 0).strain_id;
         ctx(OWNER, 0, T0);
         let _ = c.splice_strains(dom, abs); // abs → SplicedBurned
-        let _ = c.splice_strains(abs, ketiga); // abs sebagai dominan → ditolak
+        let _ = c.splice_strains(abs, ketiga); // abs as dominant → rejected
     }
 
     #[test]
     #[should_panic(expected = "ERR_STRAIN_STARVING")]
-    fn w10_splice_dominan_tier3_ditolak() {
+    fn w10_splice_dominant_tier3_rejected() {
         let (mut c, dom) = baru(10_000, StrainRole::Synthesizer, 0);
         ctx(OWNER, 0, T0);
         let _ = c.advance_sandbox_clock(60); // dom eff = 8500 - 9000 → 0
@@ -354,7 +354,7 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_MAX_GENERATION")]
-    fn w10_splice_max_generation_ditolak() {
+    fn w10_splice_max_generation_rejected() {
         let (mut c, dom, abs) = dua_strain();
         let mut v = c.strains.get(&dom).unwrap().clone();
         v.generation = constants::MAX_GENERATION;
@@ -365,8 +365,8 @@ mod qa_audit_tests {
 
     #[test]
     #[should_panic(expected = "ERR_MAX_GENERATION")]
-    fn w10_hostile_max_generation_ditolak() {
-        // Target milik LAIN menua ke Tier 2; raider OWNER generasi 8.
+    fn w10_hostile_max_generation_rejected() {
+        // A target owned by ANOTHER account ages into Tier 2; the raider OWNER is generation 8.
         ctx(OWNER, 0, T0);
         let mut c = SnaccContract::new();
         ctx(LAIN, 10_000, T0);
@@ -383,7 +383,7 @@ mod qa_audit_tests {
         let _ = c.hostile_takeover_splice(raider, target, nonce);
     }
 
-    /// View `status` & `get_solvency_tier` mengikuti tangga I-02 lewat Lazy BMR.
+    /// The `status` view & `get_solvency_tier` follow the I-02 ladder via Lazy BMR.
     #[test]
     fn w10_view_distressed_dan_solvency_tier() {
         use crate::state::{SolvencyTier, StrainStatus};
@@ -391,7 +391,7 @@ mod qa_audit_tests {
         assert_eq!(c.get_strain(id).status, StrainStatus::Active);
         assert_eq!(c.get_solvency_tier(id), SolvencyTier::Tier1Healthy);
         ctx(OWNER, 0, T0);
-        let _ = c.advance_sandbox_clock(65); // 8500 - 6500 = 2000 → Tier 2 (batas)
+        let _ = c.advance_sandbox_clock(65); // 8500 - 6500 = 2000 → Tier 2 (the boundary)
         assert_eq!(c.get_strain(id).status, StrainStatus::Distressed);
         assert_eq!(c.get_solvency_tier(id), SolvencyTier::Tier2Chapter11Distressed);
         let _ = c.advance_sandbox_clock(20); // → 0
@@ -402,7 +402,7 @@ mod qa_audit_tests {
     }
 
     // ------------------------------------------------------------------
-    // W8 — nama sub-account unik lintas generasi state
+    // W8 — sub-account names unique across state generations
     // ------------------------------------------------------------------
 
     fn ctx_h(contract: &str, predecessor: &str, deposit: u128, height: u64) {
@@ -415,10 +415,10 @@ mod qa_audit_tests {
         testing_env!(b.build());
     }
 
-    /// Reset state (migrate) → `next_strain_id` mulai ulang dari 1, tetapi nama
-    /// sub-account strain 1 berbeda dari generasi sebelumnya (tidak bentrok).
+    /// A state reset (migrate) → `next_strain_id` restarts at 1, but strain 1's
+    /// sub-account name differs from the previous generation (no clash).
     #[test]
-    fn w8_subaccount_unik_lintas_migrate() {
+    fn w8_subaccount_unique_across_migrate() {
         const K: &str = "snacc-v001.testnet";
         ctx_h(K, OWNER, 0, 100);
         let mut c = SnaccContract::new();
@@ -430,15 +430,15 @@ mod qa_audit_tests {
         let mut m = SnaccContract::migrate();
         ctx_h(K, OWNER, 10_000, 251);
         let baru = m.incubate_strain(StrainRole::Extractor, U128(0), 0);
-        assert_eq!(baru.strain_id, 1, "id mulai ulang setelah reset state");
+        assert_eq!(baru.strain_id, 1, "the id restarts after a state reset");
         assert_eq!(baru.vault_subaccount.to_string(), "s-1-250.snacc-v001.testnet");
         assert_ne!(lama.vault_subaccount, baru.vault_subaccount);
     }
 
-    /// `materialize_subaccount` memakai nama dari ledger (sama dengan view), bukan
-    /// merakit ulang `s-<id>` lama.
+    /// `materialize_subaccount` uses the name from the ledger (the same as the view), not
+    /// a rebuilt legacy `s-<id>`.
     #[test]
-    fn w8_materialize_memakai_nama_ledger() {
+    fn w8_materialize_uses_ledger_name() {
         const K: &str = "snacc-v001.testnet";
         ctx_h(K, OWNER, 0, 77);
         let mut c = SnaccContract::new();
@@ -450,9 +450,9 @@ mod qa_audit_tests {
         assert_eq!(c.get_strain(v.strain_id).pending_callbacks, 1);
     }
 
-    /// Pro-rata dua penyumbang (2:1) pada inflow besar — eksak tanpa skala 1e18.
+    /// Pro-rata of two contributors (2:1) on a large inflow — exact without the 1e18 scale.
     #[test]
-    fn div_pro_rata_dua_penyumbang_inflow_besar() {
+    fn div_pro_rata_two_contributors_large_inflow() {
         let (mut c, a) = baru(10u128.pow(24), StrainRole::Synthesizer, 0);
         ctx(OWNER, 10u128.pow(24), T0);
         let b = c.incubate_strain(StrainRole::Synthesizer, U128(0), 0).strain_id;

@@ -1,11 +1,11 @@
-//! M2 — Generator `NEP-177` Dynamic Base64 SVG (`F7`, `VC-009`).
+//! The `NEP-177` Dynamic Base64 SVG generator (M2) (`F7`, `VC-009`).
 //!
-//! Kanonik ([[Snacc - Model Data]] §Kamus Angka Resmi): **1.734 byte** batas atas,
-//! 8 indikator real-time (heartbeat, `$SNACC`, `$ATP`, slot organel, suhu, zona,
-//! koloni/generasi, bounty) + `role_mask` & `generation` (spike `S1.5`).
-//! Status `Liquidated` → merah gelap `#ff2255` + `STATUS: LIQUIDATED` (spec `F6`).
+//! Canonical ([[Snacc - Model Data]] §Kamus Angka Resmi): a **1,734-byte** upper bound,
+//! 8 real-time indicators (heartbeat, `$SNACC`, `$ATP`, organel slots, temperature, zone,
+//! colony/generation, bounty) + `role_mask` & `generation` (spike `S1.5`).
+//! A `Liquidated` status → dark red `#ff2255` + `STATUS: LIQUIDATED` (spec `F6`).
 
-/// Base64 standar (padding `=`) — encoder sendiri, nol dependensi tambahan.
+/// Standard Base64 (`=` padding) — a self-contained encoder, zero extra dependencies.
 pub fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -91,11 +91,11 @@ mod tests {
     }
 
     #[test]
-    fn vc009_svg_deterministik_dan_batas_ukuran() {
+    fn vc009_svg_deterministic_and_size_bound() {
         let a = sample_svg();
         let b = sample_svg();
         assert_eq!(a, b);
-        assert!(a.len() <= 1_734, "SVG {} byte > batas kanonik 1.734", a.len());
+        assert!(a.len() <= 1_734, "SVG {} bytes > the canonical 1,734 bound", a.len());
         assert!(a.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
     }
 
