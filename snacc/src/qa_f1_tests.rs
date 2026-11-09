@@ -94,7 +94,7 @@ mod qa_f1_tests {
         );
 
         // 4. Alchemist profile & demographics
-        let profile = c.alchemists.get(&acct(ALKEMIS)).expect("Alkemis profile registered");
+        let profile = c.alchemists.get(&acct(ALKEMIS)).expect("Alchemist profile registered");
         assert_eq!(profile.strain_count, 1);
         assert_eq!(profile.joined_sec, T0);
         assert_eq!(c.macro_state.total_births, 1, "Incubation increments total_births");
