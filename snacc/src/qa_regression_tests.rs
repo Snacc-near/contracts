@@ -194,4 +194,253 @@ mod qa_regression_tests {
         let msg = panic_text(err);
         assert!(msg.contains("ERR_ALREADY_LIQUIDATED"), "unexpected error: {msg}");
     }
+
+    // =====================================================================
+    // EN-124 — population fences across 100 division attempts
+    //
+    // Implemented fences (read from the code):
+    //  * `divide_strain` rejects at `colony_active_count >= MAX_COLONY_SIZE` (5)
+    //    → `ERR_COLONY_FULL` (paid incubation itself is unbounded by the recorded
+    //    decision — the fence guards reproduction/adoption, not paid onboarding);
+    //  * `child_generation > MAX_GENERATION` (8) → `ERR_MAX_GENERATION`;
+    //  * `total_divides > total_mergers + total_lyses` → `ERR_BIRTHS_EXCEEDED`
+    //    (the recorded `births ≤ merges + lyses` interpretation).
+    // =====================================================================
+
+    fn gen_of(c: &SnaccContract, id: StrainId) -> u8 {
+        c.strains
+            .get(&id)
+            .map(|v| v.generation)
+            .unwrap_or(u8::MAX)
+    }
+
+    /// Living (not Liquidated/SplicedBurned) strains of `owner`, ascending by id.
+    fn living_ids_of(c: &SnaccContract, owner: &str) -> Vec<StrainId> {
+        let owner = akun(owner);
+        let mut out = Vec::new();
+        for id in 1..c.next_strain_id {
+            if let Some(v) = c.strains.get(&id) {
+                if v.owner_id == owner
+                    && !matches!(
+                        v.status,
+                        StrainStatus::Liquidated | StrainStatus::SplicedBurned
+                    )
+                {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Test scaffolding: keep ATP above the §13a cost so the ATP assert never
+    /// masks the fences under test (ATP accounting itself is covered elsewhere).
+    fn top_up_atp(c: &mut SnaccContract, id: StrainId, min: u128) {
+        let mut v = c.strains.get(&id).expect("strain must exist").clone();
+        if v.atp_balance < min {
+            v.atp_balance = min;
+            let _ = c.strains.insert(id, v);
+        }
+    }
+
+    /// The invariants that must hold after EVERY step of the EN-124 loop.
+    fn assert_population_fences(c: &SnaccContract) {
+        assert!(
+            c.macro_state.total_divides
+                <= c.macro_state.total_mergers + c.macro_state.total_lyses,
+            "births gate breached: divides={} mergers={} lyses={}",
+            c.macro_state.total_divides,
+            c.macro_state.total_mergers,
+            c.macro_state.total_lyses
+        );
+        for id in 1..c.next_strain_id {
+            if let Some(v) = c.strains.get(&id) {
+                assert!(
+                    v.generation <= constants::MAX_GENERATION,
+                    "strain {id} generation {} > MAX_GENERATION {}",
+                    v.generation,
+                    constants::MAX_GENERATION
+                );
+            }
+        }
+    }
+
+    /// EN-124 — 100 division attempts against the population fences: every attempt either
+    /// succeeds with the invariants intact, or is rejected by exactly one implemented fence.
+    #[test]
+    fn en124_loop_100_divide_attempts_never_breach_population_fences() {
+        let mut c = fresh();
+        const STAKE: u128 = 1_000_000_000_000_000; // 1e15 yocto — halvings inside a ≤8-gen lineage never hit 0
+        let mut incubate_seq = 0usize;
+        let incubate = |c: &mut SnaccContract, seq: &mut usize| -> StrainId {
+            let role = match *seq % 3 {
+                0 => StrainRole::Extractor,
+                1 => StrainRole::Fermenter,
+                _ => StrainRole::Synthesizer,
+            };
+            *seq += 1;
+            incubate_at(c, OWNER, STAKE, role, T0_NS)
+        };
+        let mut attempts = 0u32;
+        let mut successes = 0u32;
+        let mut colony_full_rejects = 0u32;
+        let mut max_gen_rejects = 0u32;
+
+        // --- Phase 0: push ONE lineage to MAX_GENERATION via 8 splices. ---
+        let climber = incubate(&mut c, &mut incubate_seq); // strain 1
+        for _ in 0..u32::from(constants::MAX_GENERATION) {
+            ctx(OWNER, 0, T0_NS);
+            if living_ids_of(&c, OWNER).len() < 2 {
+                let _ = incubate(&mut c, &mut incubate_seq); // fresh partner for this splice
+            }
+            let living = living_ids_of(&c, OWNER);
+            let partner = *living.iter().find(|id| **id != climber).expect("partner");
+            assert!(
+                gen_of(&c, climber) < constants::MAX_GENERATION,
+                "climber must stay below MAX before each splice"
+            );
+            top_up_atp(&mut c, climber, 5); // §13a splice cost
+            let _ = c.splice_strains(climber, partner);
+            assert_population_fences(&c);
+        }
+        assert_eq!(gen_of(&c, climber), constants::MAX_GENERATION);
+
+        // --- Phase 0a: MAX_GENERATION fence probe (8 mergers, 0 divides → budget available). ---
+        ctx(OWNER, 0, T0_NS);
+        top_up_atp(&mut c, climber, 3); // §13a divide cost
+        attempts += 1;
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.divide_strain(climber);
+        }))
+        .expect_err("dividing a MAX_GENERATION strain must be rejected");
+        let msg = panic_text(err);
+        assert!(
+            msg.contains("ERR_MAX_GENERATION"),
+            "unexpected error at the generation fence: {msg}"
+        );
+        max_gen_rejects += 1;
+        assert_population_fences(&c);
+
+        // --- Phase 0b: COLONY_FULL fence probe (grow to MAX living cells, budget still open). ---
+        ctx(OWNER, 0, T0_NS);
+        while living_ids_of(&c, OWNER).len() < usize::from(constants::MAX_COLONY_SIZE) {
+            let _ = incubate(&mut c, &mut incubate_seq);
+        }
+        ctx(OWNER, 0, T0_NS);
+        let living = living_ids_of(&c, OWNER);
+        let probe = living[0];
+        top_up_atp(&mut c, probe, 3);
+        attempts += 1;
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.divide_strain(probe);
+        }))
+        .expect_err("dividing into a full colony must be rejected");
+        let msg = panic_text(err);
+        assert!(
+            msg.contains("ERR_COLONY_FULL"),
+            "unexpected error at the colony fence: {msg}"
+        );
+        colony_full_rejects += 1;
+        assert_population_fences(&c);
+
+        // --- Main loop: drive the attempt counter to 100 with fences checked at every step. ---
+        let mut iter = 0u32;
+        while attempts < 100 {
+            iter += 1;
+            assert!(iter < 5_000, "no progress: attempts={attempts}");
+            ctx(OWNER, 0, T0_NS); // resets the mock log buffer; same clock
+            let mut living = living_ids_of(&c, OWNER);
+            let budget_ok = c.macro_state.total_divides
+                < c.macro_state.total_mergers + c.macro_state.total_lyses;
+
+            if !budget_ok {
+                // Buy merger budget (the recorded `births` gate input).
+                if living.len() < 2 {
+                    let _ = incubate(&mut c, &mut incubate_seq);
+                    assert_population_fences(&c);
+                    continue;
+                }
+                let dom = living
+                    .iter()
+                    .copied()
+                    .find(|id| gen_of(&c, *id) < constants::MAX_GENERATION);
+                let Some(dom) = dom else {
+                    let _ = incubate(&mut c, &mut incubate_seq); // fresh gen-0 splice partner
+                    assert_population_fences(&c);
+                    continue;
+                };
+                let abs = *living.iter().find(|id| **id != dom).unwrap();
+                top_up_atp(&mut c, dom, 5);
+                let _ = c.splice_strains(dom, abs);
+                assert_population_fences(&c);
+                continue;
+            }
+
+            if living.len() >= usize::from(constants::MAX_COLONY_SIZE) {
+                // Fence probed in phase 0b — free a room via a merger and keep going.
+                let dom = living
+                    .iter()
+                    .copied()
+                    .find(|id| gen_of(&c, *id) < constants::MAX_GENERATION);
+                let Some(dom) = dom else {
+                    let _ = incubate(&mut c, &mut incubate_seq);
+                    assert_population_fences(&c);
+                    continue;
+                };
+                let abs = *living.iter().find(|id| **id != dom).unwrap();
+                top_up_atp(&mut c, dom, 5);
+                let _ = c.splice_strains(dom, abs);
+                assert_population_fences(&c);
+                continue;
+            }
+
+            // Colony has room and the budget is paid → attempt a division.
+            let young = living
+                .iter()
+                .copied()
+                .find(|id| gen_of(&c, *id) < constants::MAX_GENERATION);
+            let Some(target) = young else {
+                let _ = incubate(&mut c, &mut incubate_seq); // every living cell is gen 8
+                assert_population_fences(&c);
+                continue;
+            };
+            let before = living.len();
+            top_up_atp(&mut c, target, 3);
+            attempts += 1;
+            let res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.divide_strain(target)));
+            match res {
+                Ok(_) => {
+                    successes += 1;
+                    let after = living_ids_of(&c, OWNER).len();
+                    assert_eq!(
+                        after,
+                        before + 1,
+                        "a successful divide must add exactly one living cell"
+                    );
+                    assert!(
+                        before < usize::from(constants::MAX_COLONY_SIZE),
+                        "divide must only succeed below MAX_COLONY_SIZE"
+                    );
+                }
+                Err(e) => {
+                    let msg = panic_text(e);
+                    if msg.contains("ERR_COLONY_FULL") {
+                        colony_full_rejects += 1;
+                    } else if msg.contains("ERR_MAX_GENERATION") {
+                        max_gen_rejects += 1;
+                    } else {
+                        panic!("unexpected rejection in the main loop: {msg}");
+                    }
+                }
+            }
+            assert_population_fences(&c);
+        }
+
+        assert_eq!(attempts, 100, "exactly 100 division attempts must be made");
+        assert!(successes >= 90, "most attempts should succeed: {successes}");
+        assert!(colony_full_rejects >= 1, "the COLONY_FULL fence must fire");
+        assert!(max_gen_rejects >= 1, "the MAX_GENERATION fence must fire");
+        assert_population_fences(&c);
+    }
 }
