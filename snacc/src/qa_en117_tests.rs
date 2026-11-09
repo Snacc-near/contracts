@@ -1,6 +1,6 @@
-//! QA gap A-06 / EN-117 — ATP masuk `V_epoch` (`atp_minted × ATP_VOLUME_SCALE`).
+//! QA gap A-06 / EN-117 — ATP enters `V_epoch` (`atp_minted × ATP_VOLUME_SCALE`).
 #[cfg(test)]
-#[allow(clippy::module_inception)] // nama modul = nama file qa_*; dipertahankan agar path test tidak berubah
+#[allow(clippy::module_inception)] // module name = file name qa_*; kept so the test paths do not change
 mod qa_en117_tests {
     use crate::state::StrainRole;
     use crate::SnaccContract;
@@ -19,9 +19,9 @@ mod qa_en117_tests {
         testing_env!(b.build());
     }
 
-    /// `EN-117` — feed menambah `volume_epoch` minimal `atp_minted × ATP_VOLUME_SCALE`.
+    /// `EN-117` — feeding adds at least `atp_minted × ATP_VOLUME_SCALE` to `volume_epoch`.
     #[test]
-    fn tc_en117_atp_masuk_v_epoch() {
+    fn tc_en117_atp_enters_v_epoch() {
         ctx("alkemis.testnet", 10u128.pow(24), 1_000);
         let mut c = SnaccContract::new();
         let v = c.incubate_strain(StrainRole::Extractor, U128(10u128.pow(24)), 10);
@@ -30,12 +30,12 @@ mod qa_en117_tests {
         ctx("alkemis.testnet", 0, 1_000);
         let v2 = c.feed_strain(v.strain_id, U128(5 * 10u128.pow(17)));
         let minted = v2.atp_balance - atp0;
-        assert!(minted > 0, "feed harus mencetak ATP");
+        assert!(minted > 0, "feeding must mint ATP");
         let vol = c.get_macro_state().volume_epoch;
-        let skala = crate::state::constants::ATP_VOLUME_SCALE;
+        let scale = crate::state::constants::ATP_VOLUME_SCALE;
         assert!(
-            vol >= vol0 + minted * skala,
-            "V_epoch ({vol}) harus >= vol0 + atp_minted({minted}) x {skala}"
+            vol >= vol0 + minted * scale,
+            "V_epoch ({vol}) must be >= vol0 + atp_minted({minted}) x {scale}"
         );
     }
 }

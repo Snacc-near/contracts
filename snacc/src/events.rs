@@ -1,31 +1,31 @@
-//! Emitter event standar `NEP-297` (`EVENT_JSON:`) — `VC-010`.
+//! `NEP-297` standard event emitter (`EVENT_JSON:`) — `VC-010`.
 //!
-//! Format envelope (NEP-297):
+//! Envelope format (NEP-297):
 //! `EVENT_JSON:{"standard":"snacc","version":"1.0.0","event":"<kind>","data":[<payload>]}`
-//! di mana `<kind>` diambil dari field `"kind"` pada payload JSON yang dikirim pemanggil.
+//! where `<kind>` is taken from the `"kind"` field of the JSON payload sent by the caller.
 //!
-//! Event yang dipancarkan (sesuai spec F1–F7): `strain_created`, `extracted`,
+//! Emitted events (per spec F1–F7): `strain_created`, `extracted`,
 //! `transmuted`, `synthesized`, `genome_committed`, `genome_mutated`,
-//! `strains_spliced`, `strain_liquidated`; event lanjutan: `strain_divided`,
+//! `strains_spliced`, `strain_liquidated`; follow-up events: `strain_divided`,
 //! `strain_adopted`, `nutrient_burst_released`, `zone_changed`,
 //! `aether_burned_for_dividend`, `dividend_claimed`, `epoch_dividend_closed`.
 
-/// Nama standard event (`NEP-297` field `standard`).
+/// The event standard name (the `NEP-297` `standard` field).
 pub const STANDARD: &str = "snacc";
-/// Versi standard event (`NEP-297` field `version`).
+/// The event standard version (the `NEP-297` `version` field).
 pub const VERSION: &str = "1.0.0";
 
-/// Emit event `NEP-297` ber-standard `"snacc"` dari payload `{"kind":"<event>", ...}`.
+/// Emit a `NEP-297` event with standard `"snacc"` from a `{"kind":"<event>", ...}` payload.
 ///
-/// `kind` diangkat menjadi field `event` di envelope; payload utuh masuk `data[0]`
-/// sehingga konsumen (indexer `M5`, parser `SDK-107..108`) menerima seluruh detail.
+/// `kind` is lifted into the envelope's `event` field; the whole payload lands in `data[0]`
+/// so consumers (the `M5` indexer, the `SDK-107..108` parsers) receive every detail.
 pub fn emit_event_json(payload_json: &str) {
     emit_standard_event(STANDARD, extract_kind(payload_json).unwrap_or("unknown"), payload_json);
 }
 
-/// Emit event `NEP-297` dengan `standard` eksplisit — dipakai standar eksternal
-/// (`nep141` untuk event `ft_*` sesuai keputusan `N141-101..106`).
-/// `event` adalah nama event (field `event` envelope), payload utuh masuk `data[0]`.
+/// Emit a `NEP-297` event with an explicit `standard` — used by external standards
+/// (`nep141` for the `ft_*` events per the `N141-101..106` decision).
+/// `event` is the event name (the envelope's `event` field); the whole payload lands in `data[0]`.
 pub fn emit_standard_event(standard: &str, event: &str, payload_json: &str) {
     near_sdk::env::log_str(&format!(
         r#"EVENT_JSON:{{"standard":"{}","version":"{}","event":"{}","data":[{}]}}"#,
@@ -33,7 +33,7 @@ pub fn emit_standard_event(standard: &str, event: &str, payload_json: &str) {
     ));
 }
 
-/// Ambil nilai `"kind":"<event>"` dari payload JSON (parsing ringan, tanpa dependensi).
+/// Extract the `"kind":"<event>"` value from a JSON payload (lightweight parsing, no dependencies).
 fn extract_kind(payload_json: &str) -> Option<&str> {
     let key = "\"kind\":\"";
     let start = payload_json.find(key)? + key.len();
@@ -47,7 +47,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vc010_extract_kind_dari_payload() {
+    fn vc010_extract_kind_from_payload() {
         assert_eq!(
             extract_kind(r#"{"kind":"strain_created","strain_id":1}"#),
             Some("strain_created")

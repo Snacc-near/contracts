@@ -1,10 +1,10 @@
-//! EN-119 — tes batas per slot organel (`tc_organel_01..03`): biaya 1 ATP per
-//! kenaikan level, level ≤ `MAX_ORGANEL_LEVEL = 5`, 1×/epoch, dan warisan merge.
-//! Efek ekonomi per slot: **hanya Mitokondria yang dispesifikasikan** (rumus ATP
-//! §13a); Nukleus & Lisosom **belum dispesifikasikan** di vault (lihat
-//! `docs/organel-effects.md`) — test di sini mengunci BATAS, bukan efek.
+//! EN-119 — per-slot organel boundary tests (`tc_organel_01..03`): a cost of 1 ATP per
+//! level increase, level ≤ `MAX_ORGANEL_LEVEL = 5`, 1×/epoch, and merge inheritance.
+//! Per-slot economic effects: **only Mitochondria is specified** (the ATP
+//! §13a formula); Nucleus & Lysosome are **not yet specified** in the vault (see
+//! `docs/organel-effects.md`) — the tests here lock the BOUNDARIES, not the effects.
 #[cfg(test)]
-#[allow(clippy::module_inception)] // nama modul = nama file qa_*; dipertahankan agar path test tidak berubah
+#[allow(clippy::module_inception)] // module name = file name qa_*; kept so the test paths do not change
 mod qa_organel_tests {
     use crate::state::StrainRole;
     use crate::SnaccContract;
@@ -33,82 +33,82 @@ mod qa_organel_tests {
         (c, v.strain_id)
     }
 
-    /// TC-ORGANEL-01 — Mitokondria: level sampai 5 (biaya kumulatif 1+2+3+4+5 = 15),
-    /// level 6 ditolak `ERR_ORGANEL_LEVEL_MAX`; bonus ATP +10%/level terasa di rumus.
+    /// TC-ORGANEL-01 — Mitochondria: levels up to 5 (a cumulative cost of 1+2+3+4+5 = 15),
+    /// level 6 is rejected with `ERR_ORGANEL_LEVEL_MAX`; the +10%/level ATP bonus shows up in the formula.
     #[test]
-    fn tc_organel_01_mitokondria_batas() {
+    fn tc_organel_01_mitochondria_boundaries() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
-        // Biaya = 1 ATP per KENAIKAN level: 0→1→2→3→4→5 = 5 kenaikan × 1 ATP.
+        // The cost = 1 ATP per level INCREASE: 0→1→2→3→4→5 = 5 increases × 1 ATP.
         for level in 1..=5u8 {
             if level > 1 {
-                c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
-        c.advance_epoch(); // epoch bergerak via advance_epoch, bukan waktu
+                c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
+        c.advance_epoch(); // the epoch moves via advance_epoch, not wall time
             }
             ctx("alkemis.testnet", 0, 1_000);
             let v = c.allocate_atp(id, level, 0, 0);
             assert_eq!(v.organel.mitokondria, level);
-            assert_eq!(v.atp_balance, 50 - u128::from(level), "biaya kumulatif {level}");
+            assert_eq!(v.atp_balance, 50 - u128::from(level), "cumulative cost {level}");
         }
-        // Level 6 → ditolak.
-        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        // Level 6 → rejected.
+        c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.allocate_atp(id, 6, 0, 0);
         }));
-        assert!(res.is_err(), "level 6 harus ERR_ORGANEL_LEVEL_MAX");
+        assert!(res.is_err(), "level 6 must ERR_ORGANEL_LEVEL_MAX");
     }
 
-    /// TC-ORGANEL-02 — Nukleus: batas level & biaya sama; **tanpa efek ekonomi
-    /// tambahan** (belum dispesifikasikan — `docs/organel-effects.md`); nilainya
-    /// tersimpan dan tampil di view.
+    /// TC-ORGANEL-02 — Nucleus: the same level bounds & costs; **no additional economic
+    /// effect** (not yet specified — `docs/organel-effects.md`); the value is
+    /// stored and shown in the view.
     #[test]
-    fn tc_organel_02_nukleus_batas() {
+    fn tc_organel_02_nucleus_boundaries() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
         let v = c.allocate_atp(id, 0, 5, 0);
         assert_eq!(v.organel.nukleus, 5);
-        assert_eq!(v.atp_balance, 45, "biaya 5 ATP (1 per level)");
-        // Tidak ada efek sekunder yang bisa diamati selain penyimpanan —
-        // atp_balance hanya berubah oleh biaya alokasi ini.
-        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        assert_eq!(v.atp_balance, 45, "a cost of 5 ATP (1 per level)");
+        // No observable secondary effect beyond storage —
+        // atp_balance only changes by this allocation cost.
+        c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
-        let v2 = c.allocate_atp(id, 0, 3, 0); // turunkan level → gratis
-        assert_eq!(v2.atp_balance, 45, "penurunan level gratis");
+        let v2 = c.allocate_atp(id, 0, 3, 0); // lower the level → free
+        assert_eq!(v2.atp_balance, 45, "lowering a level is free");
         assert_eq!(v2.organel.nukleus, 3);
     }
 
-    /// TC-ORGANEL-03 — Lisosom: batas level & biaya sama; **tanpa efek ekonomi
-    /// tambahan** (belum dispesifikasikan); turun-naik level dan zeroing.
+    /// TC-ORGANEL-03 — Lysosome: the same level bounds & costs; **no additional economic
+    /// effect** (not yet specified); raising/lowering levels and zeroing.
     #[test]
-    fn tc_organel_03_lisosom_batas() {
+    fn tc_organel_03_lysosome_boundaries() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
         let v = c.allocate_atp(id, 0, 0, 4);
         assert_eq!(v.organel.lisosom, 4);
         assert_eq!(v.atp_balance, 46);
-        // Naik ke 5 di epoch berikutnya (biaya 1).
-        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        // Raise to 5 in the next epoch (a cost of 1).
+        c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let v2 = c.allocate_atp(id, 0, 0, 5);
         assert_eq!(v2.atp_balance, 45);
-        // Reset ke 0 (gratis) — slot bisa dikosongkan.
-        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        // Reset to 0 (free) — a slot can be emptied.
+        c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let v3 = c.allocate_atp(id, 0, 0, 0);
         assert_eq!(v3.organel.lisosom, 0);
         assert_eq!(v3.atp_balance, 45);
     }
-    /// TC-ORGANEL-04 (EN-119 Nukleus) — output transmute & synthesize naik +10%/level:
-    /// nukleus 5 → ×1,5; nukleus 0 → ×1. Verifikasi rumus `minted = base × (10000 +
-    /// 1000×nuk)/10000` dan level 6 tetap ditolak.
+    /// TC-ORGANEL-04 (EN-119 Nucleus) — the transmute & synthesize output rises +10%/level:
+    /// nucleus 5 → ×1.5; nucleus 0 → ×1. Verifies the `minted = base × (10000 +
+    /// 1000×nuk)/10000` formula and that level 6 is still rejected.
     #[test]
-    fn tc_organel_04_nukleus_output_produksi() {
-        // Dua strain kembar efisiensi (10800 via 1 splice): A = F+S (nukleus 5),
-        // B = F+E (nukleus 0) — satu-satunya variabel = nukleus.
+    fn tc_organel_04_nucleus_production_output() {
+        // Two twin-efficiency strains (10800 via 1 splice): A = F+S (nucleus 5),
+        // B = F+E (nucleus 0) — the only variable = the nucleus.
         ctx("alkemis.testnet", 10u128.pow(24), 1_000);
         let mut ca = SnaccContract::new();
         let ida = ca.incubate_strain(StrainRole::Fermenter, U128(10u128.pow(24)), 0).strain_id;
@@ -123,9 +123,9 @@ mod qa_organel_tests {
         let de = cb.incubate_strain(StrainRole::Extractor, U128(10u128.pow(24)), 0).strain_id;
         ctx("alkemis.testnet", 0, 1_000);
         let _ = cb.splice_strains(idb, de);
-        assert_eq!(ca.get_strain(ida).efficiency_bps, cb.get_strain(idb).efficiency_bps, "efisiensi setara");
+        assert_eq!(ca.get_strain(ida).efficiency_bps, cb.get_strain(idb).efficiency_bps, "equal efficiency");
 
-        // A: nukleus 5 (biaya 5 ATP) → minted ×1,5.
+        // A: nucleus 5 (a cost of 5 ATP) → minted ×1.5.
         ctx("alkemis.testnet", 0, 1_000);
         let _ = ca.allocate_atp(ida, 0, 5, 0);
         let _ = ca.inventories.insert((ida, "mt:spore-ignis".to_string()), 8);
@@ -134,19 +134,19 @@ mod qa_organel_tests {
         assert_eq!(
             ca.get_inventory(ida, "mt:enzyme-amalgam".to_string()).0,
             12,
-            "nukleus 5 → 8×1,08×1,5 = 12,96 → 12"
+            "nucleus 5 → 8×1.08×1.5 = 12.96 → 12"
         );
-        // B: nukleus 0 → minted dasar.
+        // B: nucleus 0 → the base minted.
         let _ = cb.inventories.insert((idb, "mt:spore-ignis".to_string()), 8);
         ctx("alkemis.testnet", 0, 1_000);
         let _ = cb.transmute_spores_to_enzyme(idb, 8, U128(0));
         assert_eq!(
             cb.get_inventory(idb, "mt:enzyme-amalgam".to_string()).0,
             8,
-            "nukleus 0 → 8×1,08×1,0 = 8,64 → 8"
+            "nucleus 0 → 8×1.08×1.0 = 8.64 → 8"
         );
-        // Synthesize: nukleus ikut mengalikan eliksir (2 batch × 1,5 = 3).
-        ca.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        // Synthesize: the nucleus also multiplies elixirs (2 batches × 1.5 = 3).
+        ca.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         ca.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000);
         let _ = ca.inventories.insert((ida, "mt:enzyme-amalgam".to_string()), 4);
@@ -156,27 +156,27 @@ mod qa_organel_tests {
         assert_eq!(
             ca.get_inventory(ida, "mt:elixir-homunculus".to_string()).0,
             3,
-            "eliksir 2 batch × 1,5 (nukleus 5) = 3"
+            "elixirs 2 batches × 1.5 (nucleus 5) = 3"
         );
     }
 
     #[test]
-    fn tc_organel_05_lisosom_umur_lebih_panjang() {
+    fn tc_organel_05_lysosome_longer_lifespan() {
         let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
-        let v = c.allocate_atp(id, 0, 0, 4); // lisosom 4 → BMR eff 60
+        let v = c.allocate_atp(id, 0, 0, 4); // lysosome 4 → effective BMR 60
         assert_eq!(v.organel.lisosom, 4);
         let vitality0 = v.vitality; // 8500
-        // 70 jam: BMR dasar 100×70 = 7000 → eff 1500; lisosom: 60×70 = 4200 → eff 4300.
+        // 70 hours: the base BMR 100×70 = 7000 → eff 1500; with the lysosome: 60×70 = 4200 → eff 4300.
         ctx("alkemis.testnet", 0, 1_000 + 70 * 3_600);
         let v70 = c.get_strain(id);
         assert_eq!(
             v70.effective_vitality,
             vitality0 - 60 * 70,
-            "lisosom 4 → BMR eff 60/jam (selamat lebih lama; tanpa lisosom sudah 1500/Distressed)"
+            "lysosome 4 → effective BMR 60/h (survives longer; without it it would already be 1500/Distressed)"
         );
-        // Batas: lisosom 5 → BMR eff 50 (min via cap level; bukan 0).
-        c.macro_state.epoch_ends_sec = 0; // tes: lewati gerbang waktu W6
+        // Bound: lysosome 5 → effective BMR 50 (the min via the level cap; not 0).
+        c.macro_state.epoch_ends_sec = 0; // test: skip the W6 time gate
         c.advance_epoch();
         ctx("alkemis.testnet", 0, 1_000 + 70 * 3_600);
         let v5 = c.allocate_atp(id, 0, 0, 5);
@@ -186,7 +186,7 @@ mod qa_organel_tests {
         assert_eq!(
             v5l.effective_vitality,
             v5.vitality - 50 * 70,
-            "lisosom 5 → BMR eff 50/jam (tidak pernah 0 — level cap 5)"
+            "lysosome 5 → effective BMR 50/h (never 0 — the level cap is 5)"
         );
     }
 }
