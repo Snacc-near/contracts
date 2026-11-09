@@ -349,7 +349,7 @@ mod qa_regression_tests {
             iter += 1;
             assert!(iter < 5_000, "no progress: attempts={attempts}");
             ctx(OWNER, 0, T0_NS); // resets the mock log buffer; same clock
-            let mut living = living_ids_of(&c, OWNER);
+            let living = living_ids_of(&c, OWNER);
             let budget_ok = c.macro_state.total_divides
                 < c.macro_state.total_mergers + c.macro_state.total_lyses;
 
@@ -442,5 +442,240 @@ mod qa_regression_tests {
         assert!(colony_full_rejects >= 1, "the COLONY_FULL fence must fire");
         assert!(max_gen_rejects >= 1, "the MAX_GENERATION fence must fire");
         assert_population_fences(&c);
+    }
+
+    // =====================================================================
+    // SEC-104 — deterministic property test for the cash invariant V-04:
+    // Σ balances + treasury + dividend pool + burned = minted (drift == 0)
+    // checked after EVERY step of a 1000-action mixed workload.
+    // =====================================================================
+
+    const ALICE: &str = "alice.testnet";
+    const BOB: &str = "bob.testnet";
+    /// Exactly 10 milliNEAR — above the 5 milliNEAR first-registration minimum.
+    const STORAGE_DEPOSIT_YOCTO: u128 = 10_000_000_000_000_000_000_000;
+
+    /// Deterministic xorshift64 PRNG (no new crate; fixed seed → reproducible workload).
+    struct XorShift64(u64);
+
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// Uniform-ish value in `0..n` (`n > 0`).
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// V-04: the ledger must stay exactly solvent after every single action.
+    fn assert_cash_invariant(c: &SnaccContract, step: &str, action: usize) {
+        let s = c.get_global_solvency();
+        assert!(
+            s.solvent,
+            "{step} (action {action}): not solvent — drift={}" ,
+            s.drift
+        );
+        assert_eq!(
+            s.drift, 0,
+            "{step} (action {action}): cash invariant V-04 breached"
+        );
+    }
+
+    /// SEC-104 — 1000 deterministic mixed actions (incubate / feed / burn / transfer /
+    /// advance_epoch / claim) with the cash invariant checked after EVERY attempt,
+    /// including failed attempts (a partial mutation must never drift either).
+    #[test]
+    fn sec104_property_1000_mixed_actions_keep_cash_invariant() {
+        let mut c = fresh();
+        // The workload clock starts 90 h in (after the bounty-funding harvest below).
+        let mut now_ns = T0_NS + 90 * HOUR_NS;
+        let mut rng = XorShift64(0x5EED_2026_1109);
+        let mut ok = [0u32; 6];
+
+        // ---- Warmup: one guaranteed success per action kind (still invariant-checked). ----
+        // Fund ALICE through a REAL flow first — liquidating a starved victim pays a
+        // 10% bounty to `account_balances[ALICE]`. (Direct ledger seeding would break
+        // V-04 by definition: unbacked money is not minted money.)
+        let victim = incubate_at(&mut c, OWNER, 10_000, StrainRole::Extractor, T0_NS);
+        // Register the transfer counterparties (NEAR storage only — no ledger impact).
+        ctx(ALICE, STORAGE_DEPOSIT_YOCTO, T0_NS);
+        let _ = c.storage_deposit(None);
+        ctx(BOB, STORAGE_DEPOSIT_YOCTO, T0_NS);
+        let _ = c.storage_deposit(None);
+        assert_cash_invariant(&c, "warmup registration", 3);
+        // At `now_ns` (90 h in) the victim is insolvent (8500 − 90×100 → 0) → ALICE liquidates it.
+        ctx(ALICE, 0, now_ns);
+        let _ = c.harvest_starving_strain(victim);
+        assert!(
+            c.account_balance(&akun(ALICE)) > 0,
+            "the 10% liquidation bounty must fund ALICE"
+        );
+        assert_cash_invariant(&c, "warmup harvest bounty", 2);
+
+        // 0 · incubate at the new clock (Synthesizer — its caste can redeem aether below).
+        const WARM_STAKE: u128 = 1_000_000_000;
+        ctx(OWNER, WARM_STAKE, now_ns);
+        let sid1 = c
+            .incubate_strain(StrainRole::Synthesizer, U128(WARM_STAKE), 0)
+            .strain_id;
+        ok[0] += 1;
+        assert_cash_invariant(&c, "warmup incubate", 0);
+
+        // 1 · feed (accrues the epoch dividend inflow — 50% of the fee, `ADR-28`).
+        ctx(OWNER, 0, now_ns);
+        let _ = c.feed_strain(sid1, U128(100_000));
+        ok[1] += 1;
+        assert_cash_invariant(&c, "warmup feed", 1);
+
+        // 2 · ft_burn (owner-only — `SEC-101`).
+        ctx(OWNER, 0, now_ns);
+        c.ft_burn(sid1, U128(100));
+        ok[2] += 1;
+        assert_cash_invariant(&c, "warmup ft_burn", 2);
+
+        // 3 · ft_transfer (registered peer, exactly 1 yoctoNEAR; ≤ ALICE's bounty balance).
+        ctx(ALICE, 1, now_ns);
+        c.ft_transfer(akun(BOB), U128(100), None);
+        ok[3] += 1;
+        assert_cash_invariant(&c, "warmup ft_transfer", 3);
+
+        // Claim chain: inject aether (test scaffolding) → redeem → close the epoch → claim.
+        let _ = c
+            .inventories
+            .insert((sid1, constants::ELIXIR_AETHER.to_string()), 5);
+        ctx(OWNER, 0, now_ns);
+        c.synthesize_and_redeem_aether(sid1, U128(1));
+        assert_cash_invariant(&c, "warmup synthesize_and_redeem_aether", 5);
+
+        // 4 · advance_epoch (26 h later — the W6 24 h gate passes).
+        now_ns += 26 * HOUR_NS;
+        ctx(OWNER, 0, now_ns);
+        c.advance_epoch();
+        ok[4] += 1;
+        assert_cash_invariant(&c, "warmup advance_epoch", 4);
+
+        // 5 · claim the closed epoch 0.
+        ctx(OWNER, 0, now_ns);
+        let payout = c.claim_industrial_dividend(sid1, 0);
+        assert!(payout.0 > 0, "the warmup claim must pay out");
+        ok[5] += 1;
+        assert_cash_invariant(&c, "warmup claim", 5);
+
+        // ---- Property loop: 1000 mixed actions, invariant after every attempt. ----
+        for step in 0..1_000usize {
+            let action = rng.below(6) as usize;
+            let success = match action {
+                // incubate
+                0 => {
+                    let stake = 1_000_000u128 + rng.below(5_000_000_000) as u128;
+                    let role = match rng.below(3) {
+                        0 => StrainRole::Extractor,
+                        1 => StrainRole::Fermenter,
+                        _ => StrainRole::Synthesizer,
+                    };
+                    ctx(OWNER, stake, now_ns);
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        c.incubate_strain(role, U128(stake), 0)
+                    }))
+                    .is_ok()
+                }
+                // feed
+                1 => {
+                    let ids = living_ids_of(&c, OWNER);
+                    if ids.is_empty() {
+                        false
+                    } else {
+                        let id = ids[rng.below(ids.len() as u64) as usize];
+                        let amount = 1 + rng.below(500) as u128;
+                        ctx(OWNER, 0, now_ns);
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            c.feed_strain(id, U128(amount))
+                        }))
+                        .is_ok()
+                    }
+                }
+                // ft_burn
+                2 => {
+                    let ids = living_ids_of(&c, OWNER);
+                    if ids.is_empty() {
+                        false
+                    } else {
+                        let id = ids[rng.below(ids.len() as u64) as usize];
+                        let bal = c.snacc_balances.get(&id).copied().unwrap_or(0);
+                        if bal == 0 {
+                            false
+                        } else {
+                            let amount = 1 + rng.below(bal.min(1_000) as u64) as u128;
+                            ctx(OWNER, 0, now_ns);
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                c.ft_burn(id, U128(amount))
+                            }))
+                            .is_ok()
+                        }
+                    }
+                }
+                // ft_transfer between the registered peers
+                3 => {
+                    let (from, to) = if rng.below(2) == 0 {
+                        (ALICE, BOB)
+                    } else {
+                        (BOB, ALICE)
+                    };
+                    let bal = c.account_balance(&akun(from));
+                    if bal == 0 {
+                        false
+                    } else {
+                        let amount = 1 + rng.below(bal.min(1_000) as u64) as u128;
+                        ctx(from, 1, now_ns); // exactly 1 yoctoNEAR
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            c.ft_transfer(akun(to), U128(amount), None)
+                        }))
+                        .is_ok()
+                    }
+                }
+                // advance_epoch after a real 26 h mock-clock jump (the W6 gate)
+                4 => {
+                    now_ns += 26 * HOUR_NS;
+                    ctx(OWNER, 0, now_ns);
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.advance_epoch()))
+                        .is_ok()
+                }
+                // claim a random closed epoch for a random living strain
+                _ => {
+                    let closed = c.macro_state.last_closed_epoch;
+                    let ids = living_ids_of(&c, OWNER);
+                    if closed == 0 || ids.is_empty() {
+                        false
+                    } else {
+                        let epoch = rng.below(closed);
+                        let id = ids[rng.below(ids.len() as u64) as usize];
+                        ctx(OWNER, 0, now_ns);
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            c.claim_industrial_dividend(id, epoch)
+                        }))
+                        .is_ok()
+                    }
+                }
+            };
+            if success {
+                ok[action] += 1;
+            }
+            // The invariant must hold after every attempt — successful OR failed.
+            assert_cash_invariant(&c, &format!("step {step}"), action);
+        }
+
+        // Every action kind must actually succeed at least once (deterministic seed).
+        assert!(
+            ok.iter().all(|&n| n > 0),
+            "every action kind needs at least one success: {ok:?}"
+        );
+        assert_cash_invariant(&c, "final", 99);
     }
 }
