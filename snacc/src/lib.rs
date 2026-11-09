@@ -1663,9 +1663,9 @@ impl SnaccContract {
             .get(&target.owner_id)
             .copied()
             .unwrap_or(0);
-        let _ = self
-            .account_balances
-            .insert(target.owner_id.clone(), seller.saturating_add(seller_payout));
+        // Credit through the tracked setter so `sum_account_balances` stays consistent
+        // with the cash invariant (parity with the deployed contract).
+        self.set_account_balance(&target.owner_id, seller.saturating_add(seller_payout));
         self.treasury = self.treasury.saturating_add(treasury_cut);
 
         // Absorb 100% of the `NEP-245` inventory + `role_mask |=` (`I-08`) + Gen+1 + max efficiency.
@@ -1832,12 +1832,17 @@ impl SnaccContract {
             .strains
             .get(&strain_id)
             .expect(constants::ERR_STRAIN_NOT_FOUND);
-        let now_ms = self.now_ms();
         let now_sec = self.now_sec();
+        self.nft_token_view_of(strain_id, v, now_sec)
+    }
+
+    /// Shared renderer behind the `nft_token` family (`nft_token`, `nft_tokens`,
+    /// `nft_tokens_for_owner`): one source of truth for the `NEP-171`/`NEP-177` view.
+    fn nft_token_view_of(&self, strain_id: StrainId, v: &StrainVessel, now_sec: u64) -> NftTokenView {
         let balance = self.snacc_balances.get(&strain_id).copied().unwrap_or(0);
         let bounty =
             balance * constants::LIQUIDATOR_BOUNTY_BPS as u128 / constants::BPS_DENOMINATOR;
-        let temp = self.macro_state.crucible_temp_at(now_ms);
+        let temp = self.macro_state.crucible_temp_at(now_sec * 1000);
         let liquidated = matches!(
             v.status,
             StrainStatus::Liquidated | StrainStatus::SplicedBurned
@@ -1858,7 +1863,7 @@ impl SnaccContract {
             liquidated,
         );
         NftTokenView {
-            token_id,
+            token_id: strain_id.to_string(),
             owner_id: v.owner_id.clone(),
             metadata: NftMetadataView {
                 title: format!("Snacc Strain #{}", strain_id),
@@ -1872,6 +1877,90 @@ impl SnaccContract {
                 ),
             },
         }
+    }
+
+    /// `NEP-177` — contract-level metadata (`nft_metadata`): the standard fields plus
+    /// an inline base64 SVG logo (one visual identity with `ft_metadata`).
+    pub fn nft_metadata(&self) -> NftContractMetadata {
+        let logo = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><rect width=\"64\" height=\"64\" fill=\"#1b0f2e\"/><text x=\"32\" y=\"43\" font-family=\"monospace\" font-size=\"30\" fill=\"#ff8a3d\" text-anchor=\"middle\">S</text></svg>";
+        NftContractMetadata {
+            spec: "nft-1.0.0".to_string(),
+            name: "Snacc".to_string(),
+            symbol: "$SNACC".to_string(),
+            icon: Some(format!(
+                "data:image/svg+xml;base64,{}",
+                svg::base64_encode(logo.as_bytes())
+            )),
+            base_uri: None,
+            reference: None,
+            reference_hash: None,
+        }
+    }
+
+    /// `NEP-181` — total minted NFTs (`nft_total_supply`).
+    pub fn nft_total_supply(&self) -> U128 {
+        U128(self.next_strain_id.saturating_sub(1) as u128)
+    }
+
+    /// `NEP-181` — paginated enumeration (`nft_tokens`).
+    pub fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<NftTokenView> {
+        let start = from_index.unwrap_or(U128(0)).0 as u64;
+        let now_sec = self.now_sec();
+        let total = self.next_strain_id.saturating_sub(1);
+        let mut out = Vec::new();
+        let mut i = start;
+        while i < total && (limit.is_none() || (out.len() as u64) < limit.unwrap()) {
+            i += 1;
+            if let Some(v) = self.strains.get(&i) {
+                out.push(self.nft_token_view_of(i, v, now_sec));
+            }
+        }
+        out
+    }
+
+    /// `NEP-181` — per-owner supply (`nft_supply_for_owner`), exact scan of `strains`.
+    pub fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
+        let mut count: u64 = 0;
+        for id in 1..self.next_strain_id {
+            if let Some(v) = self.strains.get(&id) {
+                if v.owner_id == account_id {
+                    count += 1;
+                }
+            }
+        }
+        U128(count as u128)
+    }
+
+    /// `NEP-181` — per-owner enumeration (`nft_tokens_for_owner`) with pagination.
+    pub fn nft_tokens_for_owner(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<NftTokenView> {
+        let start = from_index.unwrap_or(U128(0)).0 as u64;
+        let mut owned: Vec<StrainId> = (1..self.next_strain_id)
+            .filter(|id| {
+                self.strains
+                    .get(id)
+                    .map(|v| v.owner_id == account_id)
+                    .unwrap_or(false)
+            })
+            .collect();
+        owned.sort_unstable();
+        let now_sec = self.now_sec();
+        let mut out = Vec::new();
+        for (_idx, id) in owned.iter().enumerate().skip(start as usize) {
+            if let Some(cap) = limit {
+                if (out.len() as u64) >= cap {
+                    break;
+                }
+            }
+            if let Some(v) = self.strains.get(id) {
+                out.push(self.nft_token_view_of(*id, v, now_sec));
+            }
+        }
+        out
     }
 }
 
@@ -2031,13 +2120,45 @@ impl SnaccContract {
     }
 
     /// `N141-104` — `storage_deposit` MVP: account -> total deposit registry (milliNEAR).
+    /// `registration_only = true` registers with exactly the minimum and refunds any
+    /// excess (NEP-145 `registration_only` semantics).
     #[payable]
-    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) -> StorageBalance {
+    pub fn storage_deposit(
+        &mut self,
+        account_id: Option<AccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
         let target = account_id.unwrap_or_else(env::predecessor_account_id);
         let attached = env::attached_deposit().as_yoctonear();
         let min_yocto =
             NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR).as_yoctonear();
         let existing = self.registered_storage.get(&target).copied().unwrap_or(0);
+        if registration_only.unwrap_or(false) {
+            if existing > 0 {
+                if attached > 0 {
+                    let _ = Promise::new(target).transfer(NearToken::from_yoctonear(attached));
+                }
+                let total = existing;
+                return StorageBalance {
+                    total: U128(total),
+                    available: U128(total),
+                };
+            }
+            assert!(
+                attached >= min_yocto,
+                "{}",
+                constants::ERR_INSUFFICIENT_DEPOSIT
+            );
+            let _ = self.registered_storage.insert(target.clone(), min_yocto);
+            if attached > min_yocto {
+                let _ =
+                    Promise::new(target).transfer(NearToken::from_yoctonear(attached - min_yocto));
+            }
+            return StorageBalance {
+                total: U128(min_yocto),
+                available: U128(min_yocto),
+            };
+        }
         if existing == 0 {
             // The 5 milliNEAR minimum applies only to first registration (recorded decision).
             assert!(
@@ -2110,6 +2231,45 @@ impl SnaccContract {
                 available: U128(total),
             })
     }
+
+    /// `NEP-145` — storage balance bounds (`storage_balance_bounds`): the recorded
+    /// first-registration minimum, no upper bound.
+    pub fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        StorageBalanceBounds {
+            min: U128(
+                NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR).as_yoctonear(),
+            ),
+            max: None,
+        }
+    }
+
+    /// `NEP-145` — `storage_unregister(force)`: removes the caller's registration and
+    /// refunds the locked deposit (1 yoctoNEAR guard). With `$SNACC` still on the
+    /// account the refund is refused unless `force = true` (recorded MVP rule).
+    #[payable]
+    pub fn storage_unregister(&mut self, force: Option<bool>) -> Option<StorageBalance> {
+        Self::assert_one_yocto();
+        let caller = env::predecessor_account_id();
+        let total = self
+            .registered_storage
+            .get(&caller)
+            .copied()
+            .unwrap_or(0);
+        if total == 0 {
+            return None;
+        }
+        if self.account_balance(&caller) > 0 && !force.unwrap_or(false) {
+            env::panic_str(constants::ERR_INSUFFICIENT_DEPOSIT);
+        }
+        let _ = self.registered_storage.remove(&caller);
+        if total > 0 {
+            let _ = Promise::new(caller).transfer(NearToken::from_yoctonear(total));
+        }
+        Some(StorageBalance {
+            total: U128(total),
+            available: U128(total),
+        })
+    }
 }
 
 /// `NEP-141` metadata (`N141-103`) — standard subset + inline SVG icon.
@@ -2131,6 +2291,27 @@ pub struct FungibleTokenMetadata {
 pub struct StorageBalance {
     pub total: U128,
     pub available: U128,
+}
+
+/// `NEP-145` — storage balance bounds (`storage_balance_bounds`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageBalanceBounds {
+    pub min: U128,
+    pub max: Option<U128>,
+}
+
+/// `NEP-177` — contract-level metadata (`nft_metadata`).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NftContractMetadata {
+    pub spec: String,
+    pub name: String,
+    pub symbol: String,
+    pub icon: Option<String>,
+    pub base_uri: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<String>,
 }
 
 // =====================================================================
@@ -3378,6 +3559,18 @@ mod qa_ma_tests;
 mod qa_dk026_tests;
 
 #[cfg(test)]
+mod qa_nep_tests;
+
+#[cfg(test)]
+mod qa_tee_tests;
+
+#[cfg(test)]
+mod qa_en124_tests;
+
+#[cfg(test)]
+mod qa_diet_tests;
+
+#[cfg(test)]
 mod qa_audit_tests;
 
 #[cfg(test)]
@@ -4452,7 +4645,7 @@ mod tests {
     /// Register an account (the MVP 5-milliNEAR storage deposit).
     fn register(c: &mut SnaccContract, account: &str) {
         set_context(account, NearToken::from_millinear(constants::STORAGE_DEPOSIT_MILLINEAR));
-        let _ = c.storage_deposit(None);
+        let _ = c.storage_deposit(None, None);
     }
 
     fn fund(c: &mut SnaccContract, account: &str, amount: u128) {
@@ -4630,7 +4823,7 @@ mod tests {
 
         // Attach another deposit -> the total grows.
         set_context(ALICE, NearToken::from_millinear(3));
-        let bal2 = c.storage_deposit(Some(alice.clone()));
+        let bal2 = c.storage_deposit(Some(alice.clone()), None);
         assert_eq!(bal2.total.0, NearToken::from_millinear(8).as_yoctonear());
 
         // Not holding $SNACC yet -> a full withdrawal is possible; the entry is removed (deregistration).
@@ -4665,7 +4858,7 @@ mod tests {
     fn n141_storage_deposit_below_minimum_rejected() {
         let mut c = SnaccContract::new();
         set_context(ALICE, NearToken::from_millinear(4));
-        let _ = c.storage_deposit(None);
+        let _ = c.storage_deposit(None, None);
     }
 
     // ------------------------------------------------------------------

@@ -506,9 +506,9 @@ mod qa_regression_tests {
         let victim = incubate_at(&mut c, OWNER, 10_000, StrainRole::Extractor, T0_NS);
         // Register the transfer counterparties (NEAR storage only — no ledger impact).
         ctx(ALICE, STORAGE_DEPOSIT_YOCTO, T0_NS);
-        let _ = c.storage_deposit(None);
+        let _ = c.storage_deposit(None, None);
         ctx(BOB, STORAGE_DEPOSIT_YOCTO, T0_NS);
-        let _ = c.storage_deposit(None);
+        let _ = c.storage_deposit(None, None);
         assert_cash_invariant(&c, "warmup registration", 3);
         // At `now_ns` (90 h in) the victim is insolvent (8500 − 90×100 → 0) → ALICE liquidates it.
         ctx(ALICE, 0, now_ns);
