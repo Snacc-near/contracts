@@ -3381,6 +3381,9 @@ mod qa_dk026_tests;
 mod qa_audit_tests;
 
 #[cfg(test)]
+mod qa_regression_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use near_sdk::serde_json;
