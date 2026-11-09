@@ -14,19 +14,19 @@ mod qa_organel_tests {
     use near_sdk::testing_env;
     use near_sdk::NearToken;
 
-    fn akun(s: &str) -> near_sdk::AccountId {
+    fn acct(s: &str) -> near_sdk::AccountId {
         s.parse().unwrap()
     }
     fn ctx(predecessor: &str, deposit_yocto: u128, ts_sec: u64) {
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun("snacc-v001.testnet"))
-            .signer_account_id(akun(predecessor))
-            .predecessor_account_id(akun(predecessor))
+        b.current_account_id(acct("snacc-v001.testnet"))
+            .signer_account_id(acct(predecessor))
+            .predecessor_account_id(acct(predecessor))
             .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
             .block_timestamp(ts_sec * 1_000_000_000);
         testing_env!(b.build());
     }
-    fn baru(stake: u128, role: StrainRole, spores: u64) -> (SnaccContract, StrainId) {
+    fn fresh_contract(stake: u128, role: StrainRole, spores: u64) -> (SnaccContract, StrainId) {
         ctx("alkemis.testnet", stake, 1_000);
         let mut c = SnaccContract::new();
         let v = c.incubate_strain(role, U128(stake), spores);
@@ -37,7 +37,7 @@ mod qa_organel_tests {
     /// level 6 is rejected with `ERR_ORGANEL_LEVEL_MAX`; the +10%/level ATP bonus shows up in the formula.
     #[test]
     fn tc_organel_01_mitochondria_boundaries() {
-        let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
+        let (mut c, id) = fresh_contract(10u128.pow(24), StrainRole::Extractor, 0);
         // The cost = 1 ATP per level INCREASE: 0→1→2→3→4→5 = 5 increases × 1 ATP.
         for level in 1..=5u8 {
             if level > 1 {
@@ -64,7 +64,7 @@ mod qa_organel_tests {
     /// stored and shown in the view.
     #[test]
     fn tc_organel_02_nucleus_boundaries() {
-        let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
+        let (mut c, id) = fresh_contract(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
         let v = c.allocate_atp(id, 0, 5, 0);
         assert_eq!(v.organel.nukleus, 5);
@@ -83,7 +83,7 @@ mod qa_organel_tests {
     /// effect** (not yet specified); raising/lowering levels and zeroing.
     #[test]
     fn tc_organel_03_lysosome_boundaries() {
-        let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
+        let (mut c, id) = fresh_contract(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
         let v = c.allocate_atp(id, 0, 0, 4);
         assert_eq!(v.organel.lisosom, 4);
@@ -162,7 +162,7 @@ mod qa_organel_tests {
 
     #[test]
     fn tc_organel_05_lysosome_longer_lifespan() {
-        let (mut c, id) = baru(10u128.pow(24), StrainRole::Extractor, 0);
+        let (mut c, id) = fresh_contract(10u128.pow(24), StrainRole::Extractor, 0);
         ctx("alkemis.testnet", 0, 1_000);
         let v = c.allocate_atp(id, 0, 0, 4); // lysosome 4 → effective BMR 60
         assert_eq!(v.organel.lisosom, 4);

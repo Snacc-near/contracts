@@ -11,14 +11,14 @@ mod qa_ma_tests {
     use near_sdk::testing_env;
     use near_sdk::NearToken;
 
-    fn akun(s: &str) -> near_sdk::AccountId {
+    fn acct(s: &str) -> near_sdk::AccountId {
         s.parse().unwrap()
     }
     fn ctx(predecessor: &str, deposit_yocto: u128, ts_sec: u64) {
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun("snacc-v001.testnet"))
-            .signer_account_id(akun(predecessor))
-            .predecessor_account_id(akun(predecessor))
+        b.current_account_id(acct("snacc-v001.testnet"))
+            .signer_account_id(acct(predecessor))
+            .predecessor_account_id(acct(predecessor))
             .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
             .block_timestamp(ts_sec * 1_000_000_000);
         testing_env!(b.build());
@@ -73,11 +73,11 @@ mod qa_ma_tests {
         assert!(res.is_err(), "a stale nonce must ERR_STATE_NONCE_CHANGED_SELLER_DRAIN_BLOCKED");
         // The correct nonce (0) → takeover; book = 8×10^23; payment = 115% = 9.2×10^23.
         let treasury0 = c.treasury;
-        let seller0 = c.ft_balance_of(akun("owner.testnet")).0;
+        let seller0 = c.ft_balance_of(acct("owner.testnet")).0;
         let atp0 = c.get_strain(raider).atp_balance;
         let (_, view) = c.hostile_takeover_splice(raider, target, 0);
         let payment = 92 * 10u128.pow(22); // 8×10^23 × 1.15
-        assert_eq!(c.ft_balance_of(akun("owner.testnet")).0 - seller0, payment * 95 / 100, "95% to the seller");
+        assert_eq!(c.ft_balance_of(acct("owner.testnet")).0 - seller0, payment * 95 / 100, "95% to the seller");
         assert_eq!(c.treasury - treasury0, payment * 5 / 100, "5% to the treasury");
         assert_eq!(view.atp_balance, atp0 - 10, "the hostile ATP cost = 10 (§13a)");
         assert_eq!(c.get_strain(target).status, crate::state::StrainStatus::SplicedBurned);
@@ -110,8 +110,8 @@ mod qa_ma_tests {
         );
         // (ii) the #[private] callback executes (the promise SUCCEEDS) → the lock is released (0).
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun("snacc-v001.testnet"))
-            .predecessor_account_id(akun("snacc-v001.testnet"))
+        b.current_account_id(acct("snacc-v001.testnet"))
+            .predecessor_account_id(acct("snacc-v001.testnet"))
             .attached_deposit(NearToken::from_yoctonear(0))
             .block_timestamp(1_000 * 1_000_000_000);
         testing_env!(
@@ -123,15 +123,15 @@ mod qa_ma_tests {
         );
         c.on_subaccount_created(
             id,
-            akun("s-1.snacc-v001.testnet"),
-            akun("alkemis.testnet"),
+            acct("s-1.snacc-v001.testnet"),
+            acct("alkemis.testnet"),
             U128(2 * 10u128.pow(22)),
         );
         assert_eq!(c.get_strain(id).pending_callbacks, 0, "the lock is released after the callback");
         // After release → M&A is now valid (the other conditions hold).
         ctx("raider.testnet", 0, 1_000 + 70 * 3_600);
         let _ = c.adopt(id, raider, c.get_strain(id).state_nonce);
-        assert_eq!(c.get_strain(id).owner_id, akun("raider.testnet"));
+        assert_eq!(c.get_strain(id).owner_id, acct("raider.testnet"));
     }
 
     /// SEC-111 — the lock is also on during `nft_transfer_call` and released in
@@ -143,7 +143,7 @@ mod qa_ma_tests {
         let id = c.incubate_strain(StrainRole::Extractor, U128(10u128.pow(24)), 0).strain_id;
         ctx("alkemis.testnet", 1, 1_000);
         let _ = c.nft_transfer_call(
-            akun("alice.testnet"),
+            acct("alice.testnet"),
             id.to_string(),
             "msg".to_string(),
             None,
@@ -153,8 +153,8 @@ mod qa_ma_tests {
         // Resolved in the unit test: promise_result = Failed → rejected; the rejection path
         // ALSO releases the lock and the token returns to the old owner.
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun("snacc-v001.testnet"))
-            .predecessor_account_id(akun("snacc-v001.testnet"))
+        b.current_account_id(acct("snacc-v001.testnet"))
+            .predecessor_account_id(acct("snacc-v001.testnet"))
             .attached_deposit(NearToken::from_yoctonear(0))
             .block_timestamp(1_000 * 1_000_000_000);
         testing_env!(
@@ -164,9 +164,9 @@ mod qa_ma_tests {
             Default::default(),
             vec![near_sdk::PromiseResult::Failed]
         );
-        c.nft_resolve_transfer(akun("alkemis.testnet"), akun("alice.testnet"), id.to_string());
+        c.nft_resolve_transfer(acct("alkemis.testnet"), acct("alice.testnet"), id.to_string());
         assert_eq!(c.get_strain(id).pending_callbacks, 0, "the lock is released after resolve");
-        assert_eq!(c.get_strain(id).owner_id, akun("alkemis.testnet"), "the token returns");
+        assert_eq!(c.get_strain(id).owner_id, acct("alkemis.testnet"), "the token returns");
     }
 
 

@@ -4,7 +4,7 @@
 //! `NEP-141` ($SNACC) · `NEP-171`/`NEP-177` (Homunculus Strain + live SVG) ·
 //! `NEP-245` (9 molecules) · mechanics F1–F7 (M&A, Cell Lysis, TEE zero-trust).
 //!
-//! Peta: [[Snacc - Katalog Fitur]] · [[Snacc - Spec Antarmuka Kontrak]] ·
+//! Map: [[Snacc - Katalog Fitur]] · [[Snacc - Spec Antarmuka Kontrak]] ·
 //! [[Snacc - Model Data]] (D1–D9) · [[Snacc - Backlog Master]].
 
 pub mod events;
@@ -4089,7 +4089,7 @@ mod tests {
 
     /// (a) verify the REAL signature (`env::ed25519_verify`) over the spike's signed_text.
     #[test]
-    fn vc006_signature_rial_vector_lulus() {
+    fn vc006_signature_real_vector_passes() {
         set_context(ALKEMIS_ID, NearToken::from_yoctonear(0));
         assert!(SnaccContract::verify_tee_receipt(
             TEE_REQ_SHA,
