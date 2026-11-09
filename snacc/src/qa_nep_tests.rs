@@ -251,4 +251,230 @@ mod qa_nep_tests {
         assert_eq!(page[0].token_id, "2");
         assert_eq!(page[0].owner_id, test_account("alkemis.testnet"));
     }
+
+    // ── NEP-141 `ft_mint` (N141-105) ───────────────────────────────────────
+    // NOTE: `near_sdk::test_utils::get_logs()` only returns the logs of the
+    // CURRENT mock context (each `ctx()` starts a fresh one), so the tests
+    // drain the logs into an accumulator after every mutating call.
+
+    fn drain_logs(acc: &mut Vec<String>) {
+        acc.extend(near_sdk::test_utils::get_logs());
+    }
+
+    fn count_in(logs: &[String], event: &str) -> usize {
+        let marker = format!(r#""event":"{}""#, event);
+        logs.iter().filter(|l| l.contains(marker.as_str())).count()
+    }
+
+    /// Sum the `amount` of every `EVENT_JSON` line with `"event":"<event>"`.
+    /// Handles both encodings: `ft_mint` uses the NEP-141 string form
+    /// (`"amount":"123"`), the legacy `ft_transfer`/`ft_burn` use a number.
+    fn sum_in(logs: &[String], event: &str) -> u128 {
+        let marker = format!(r#""event":"{}""#, event);
+        let mut total = 0u128;
+        for line in logs {
+            if !line.contains(marker.as_str()) {
+                continue;
+            }
+            let key = r#""amount":"#;
+            let start = line.find(key).expect("amount field present") + key.len();
+            let rest = &line[start..];
+            // String form (`"amount":"123"`) carries the closing quote; the
+            // number form (`"amount":123`) does not.
+            let digits = rest.strip_prefix('"').unwrap_or(rest);
+            let end = digits
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(digits.len());
+            total += digits[..end].parse::<u128>().unwrap_or(0);
+        }
+        total
+    }
+
+    /// TC-NEP-09 — incubating with an attached NEAR stake emits exactly one
+    /// NEP-141 `ft_mint` (standard `nep141`, amount as string) for the full
+    /// stake, and the supply grows by the same amount.
+    #[test]
+    fn tc_nep09_ft_mint_event_on_near_stake_incubate() {
+        let stake: u128 = 10u128.pow(24);
+        ctx("alkemis.testnet", stake, 1_000);
+        let mut c = SnaccContract::new();
+        drain_logs(&mut Vec::new());
+        ctx("alkemis.testnet", stake, 1_000);
+        let _ = c.incubate_strain(StrainRole::Extractor, U128(stake), 0);
+
+        assert_eq!(
+            c.ft_total_supply().0, stake,
+            "the NEAR stake is born into the supply"
+        );
+        let mut all = Vec::new();
+        drain_logs(&mut all);
+        assert_eq!(count_in(&all, "ft_mint"), 1, "exactly one ft_mint");
+        let expected = format!(
+            r#"EVENT_JSON:{{"standard":"nep141","version":"1.0.0","event":"ft_mint","data":[{{"owner_id":"alkemis.testnet","amount":"{}","memo":"incubate_strain"}}]}}"#,
+            stake
+        );
+        assert!(
+            all.iter().any(|l| l == &expected),
+            "exact ft_mint line missing:\n{expected}\nlogs: {:?}",
+            all
+        );
+    }
+
+    /// TC-NEP-10 — a balance-funded incubate (`attached = 0`, the stake is
+    /// debited from the caller's `account_balances`) mints nothing: no
+    /// `ft_mint`, no supply change. The lysis bounty that funded the account
+    /// is likewise a pure transfer (strain balance → caller + treasury).
+    #[test]
+    fn tc_nep10_no_ft_mint_on_balance_funded_incubate() {
+        let stake: u128 = 10_000;
+        let mut all = Vec::new();
+        ctx("alkemis.testnet", stake, 1_000);
+        let mut c = SnaccContract::new();
+        ctx("alkemis.testnet", stake, 1_000);
+        let _s1 = c.incubate_strain(StrainRole::Extractor, U128(stake), 0).strain_id;
+        drain_logs(&mut all);
+        ctx("bob.testnet", stake, 1_000);
+        let s2 = c.incubate_strain(StrainRole::Extractor, U128(stake), 0).strain_id;
+        drain_logs(&mut all);
+        assert_eq!(count_in(&all, "ft_mint"), 2);
+        let supply_after_mints = c.ft_total_supply().0;
+        assert_eq!(supply_after_mints, 2 * stake);
+
+        // Lysis bounty (10% of the starved strain balance) funds alkemis's
+        // account — a transfer, not a mint.
+        ctx("alkemis.testnet", 0, 1_000 + 90 * 3600);
+        let (bounty, _) = c.harvest_starving_strain(s2);
+        drain_logs(&mut all);
+        assert!(bounty.0 > 0, "the bounty must fund the account");
+        assert_eq!(c.ft_total_supply().0, supply_after_mints, "no mint on lysis");
+        assert_eq!(count_in(&all, "ft_mint"), 2, "no ft_mint on lysis bounty");
+
+        // Balance-funded incubate: the account is debited, supply untouched.
+        let funded = bounty.0 / 2;
+        ctx("alkemis.testnet", 0, 1_000);
+        let _ = c.incubate_strain(StrainRole::Extractor, U128(funded), 0);
+        drain_logs(&mut all);
+        assert_eq!(
+            c.ft_total_supply().0, supply_after_mints,
+            "balance-funded incubate grows no supply"
+        );
+        assert_eq!(count_in(&all, "ft_mint"), 2, "no ft_mint on balance-funded incubate");
+        assert_eq!(
+            c.ft_balance_of(test_account("alkemis.testnet")).0,
+            bounty.0 - funded,
+            "the account balance paid the stake"
+        );
+    }
+
+    /// TC-NEP-11 — `ft_transfer` emits `ft_transfer` only: no `ft_mint`, no
+    /// supply change (sender debited, receiver credited, same total).
+    #[test]
+    fn tc_nep11_no_ft_mint_on_ft_transfer() {
+        let stake: u128 = 10_000;
+        let mut all = Vec::new();
+        ctx("alkemis.testnet", stake, 1_000);
+        let mut c = SnaccContract::new();
+        ctx("alkemis.testnet", stake, 1_000);
+        let _s1 = c.incubate_strain(StrainRole::Extractor, U128(stake), 0).strain_id;
+        drain_logs(&mut all);
+        ctx("bob.testnet", stake, 1_000);
+        let s2 = c.incubate_strain(StrainRole::Extractor, U128(stake), 0).strain_id;
+        drain_logs(&mut all);
+        // Register bob (NEP-145 — NEAR storage, no `$SNACC` ledger impact).
+        let min = NearToken::from_millinear(5).as_yoctonear();
+        ctx("bob.testnet", min, 1_000);
+        let _ = c.storage_deposit(None, None);
+        drain_logs(&mut all);
+        // Fund alkemis's account via the lysis bounty, then transfer 100 to bob.
+        ctx("alkemis.testnet", 0, 1_000 + 90 * 3600);
+        let (bounty, _) = c.harvest_starving_strain(s2);
+        drain_logs(&mut all);
+        assert!(bounty.0 > 100);
+
+        let mints_before = count_in(&all, "ft_mint");
+        let supply_before = c.ft_total_supply().0;
+        ctx("alkemis.testnet", 1, 1_000);
+        c.ft_transfer(test_account("bob.testnet"), U128(100), None);
+        drain_logs(&mut all);
+
+        assert_eq!(count_in(&all, "ft_mint"), mints_before, "no ft_mint on transfer");
+        assert_eq!(count_in(&all, "ft_transfer"), 1, "ft_transfer emitted");
+        assert_eq!(
+            c.ft_total_supply().0, supply_before,
+            "a pure transfer changes no supply"
+        );
+        assert_eq!(c.ft_balance_of(test_account("bob.testnet")).0, 100);
+        assert_eq!(
+            c.ft_balance_of(test_account("alkemis.testnet")).0,
+            bounty.0 - 100
+        );
+    }
+
+    /// TC-NEP-12 — `I-01` consistency over a multi-step scenario:
+    /// Σ(`ft_mint`) − Σ(`ft_burn`) == Δ`ft_total_supply`. The scenario mixes
+    /// NEAR-stake incubates (mints), a Hypothermia rebate (treasury → strain
+    /// transfer), a lysis bounty (transfer), a balance-funded incubate (no
+    /// mint), an `ft_burn`, and an `ft_transfer` — only the two mint paths
+    /// and the burn move the net event balance.
+    #[test]
+    fn tc_nep12_ft_mint_minus_ft_burn_equals_supply_delta() {
+        let stake_a: u128 = 20_000;
+        let stake_b: u128 = 10_000;
+        let mut all = Vec::new();
+        ctx("alkemis.testnet", stake_a, 1_000);
+        let mut c = SnaccContract::new();
+        ctx("alkemis.testnet", stake_a, 1_000);
+        let s1 = c.incubate_strain(StrainRole::Extractor, U128(stake_a), 0).strain_id;
+        drain_logs(&mut all);
+        ctx("bob.testnet", stake_b, 1_000);
+        let s2 = c.incubate_strain(StrainRole::Extractor, U128(stake_b), 0).strain_id;
+        drain_logs(&mut all);
+
+        // Hypothermia rebate (treasury → strain): a transfer, no `ft_mint`.
+        // fee = 3_000 on supply 30_000 → temp = 100 < 600.
+        let fee: u128 = 3_000;
+        let strain_bal_before = c.snacc_balances.get(&s1).copied().unwrap_or(0);
+        ctx("alkemis.testnet", fee, 1_000);
+        let _ = c.extract_spores(s1, "mt:spore-ignis".to_string(), U128(fee));
+        drain_logs(&mut all);
+        assert!(
+            c.snacc_balances.get(&s1).copied().unwrap_or(0) > strain_bal_before,
+            "the rebate must credit the strain"
+        );
+        assert_eq!(count_in(&all, "ft_mint"), 2, "no ft_mint on the rebate");
+
+        // Register bob, then fund alkemis's account by harvesting s2.
+        let min = NearToken::from_millinear(5).as_yoctonear();
+        ctx("bob.testnet", min, 1_000);
+        let _ = c.storage_deposit(None, None);
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", 0, 1_000 + 90 * 3600);
+        let (bounty, _) = c.harvest_starving_strain(s2);
+        drain_logs(&mut all);
+        assert!(bounty.0 > 0);
+
+        // Balance-funded incubate (no mint), then ft_burn + ft_transfer.
+        ctx("alkemis.testnet", 0, 1_000);
+        let funded = bounty.0 / 2;
+        let _ = c.incubate_strain(StrainRole::Extractor, U128(funded), 0);
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", 0, 1_000);
+        c.ft_burn(s1, U128(500));
+        drain_logs(&mut all);
+        ctx("alkemis.testnet", 1, 1_000);
+        c.ft_transfer(test_account("bob.testnet"), U128(100), None);
+        drain_logs(&mut all);
+
+        let minted = sum_in(&all, "ft_mint");
+        let burned = sum_in(&all, "ft_burn");
+        let supply = c.ft_total_supply().0;
+        assert_eq!(minted, stake_a + stake_b, "only the two NEAR stakes minted");
+        assert_eq!(burned, 500);
+        assert_eq!(
+            minted - burned,
+            supply,
+            "I-01: the event net must equal the supply"
+        );
+        assert_eq!(supply, stake_a + stake_b - 500);
+    }
 }

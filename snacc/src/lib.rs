@@ -418,6 +418,20 @@ impl SnaccContract {
         self.treasury += to_treasury;
         if mint_new_supply {
             self.macro_state.total_snacc_supply += stake;
+            // `N141-105` — NEP-297 event with standard `nep141` (`ft_mint`):
+            // the only true `$SNACC` mint path (`new` mints nothing; every other
+            // credit — rebate, dividend claim, lysis bounty, M&A/adopt payment,
+            // NPC trade, `ft_transfer` — moves existing balances between
+            // ledgers and leaves `total_snacc_supply` unchanged). Amount is a
+            // string per the NEP-141 standard.
+            events::emit_standard_event(
+                "nep141",
+                "ft_mint",
+                &format!(
+                    r#"{{"owner_id":"{}","amount":"{}","memo":"incubate_strain"}}"#,
+                    owner_id, stake
+                ),
+            );
         }
         if self.macro_state.current_epoch == 0 {
             self.macro_state.epoch_treasury_initial += to_treasury;
