@@ -16,6 +16,6 @@ jobs:
         run: cargo test
       - name: cargo check wasm
         run: cargo check --target wasm32-unknown-unknown
-      # DK-084: clippy fatal — warning apa pun menggagalkan CI (0 warning per 2026-11-08).
+      # DK-084: clippy is fatal — any warning fails CI (0 warnings per 2026-11-08).
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings

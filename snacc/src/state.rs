@@ -49,7 +49,7 @@ pub mod constants {
     pub const ERR_SANDBOX_CLOCK_DISABLED: &str = "ERR_SANDBOX_CLOCK_DISABLED";
     /// The cap of one `advance_sandbox_clock` call (30 days) — anti-overflow/typo.
     pub const MAX_SANDBOX_ADVANCE_HOURS: u64 = 720;
-    /// Batas atas diskon Nutrient Burst (`EN-01`, spec `0..2000`).
+    /// The Nutrient Burst discount cap (`EN-01`, spec `0..2000`).
     pub const MAX_BURST_BPS: u16 = 2000;
     /// `F1` — vitalitas awal Strain Genesis = `8500` (`85.00%`).
     pub const INITIAL_VITALITY: u64 = 8500;
@@ -179,7 +179,7 @@ pub mod constants {
     pub const MAX_DIVIDEND_CLAIM_EPOCHS: u64 = 8;
     /// `MIN_AETHER_BURN = 1` — prevents 0-amount spam (recorded decision: not nominalized in the spec).
     pub const MIN_AETHER_BURN: u128 = 1;
-    /// `EN-01` — `BASE_BURST_BPS = 200` (2%), selaras `REBATE_BPS` (Spec Enhancement §3.3).
+    /// `EN-01` — `BASE_BURST_BPS = 200` (2%), aligned with `REBATE_BPS` (Spec Enhancement §3.3).
     pub const BASE_BURST_BPS: u16 = 200;
     /// `EN-01` — `BURST_DURATION_EPOCHS = 1`.
     pub const BURST_DURATION_EPOCHS: u64 = 1;
@@ -375,9 +375,9 @@ pub struct StrainVessel {
     pub atp_balance: u128,
     /// `F3` (`ADR-21`): komitmen `req_sha256_hex` Phase 1 (`commit_genome_experiment`).
     pub pending_commitment: Option<String>,
-    /// `F3`: trait fenotip hasil mutasi TEE (payload `phenotype_trait`).
+    /// `F3`: the phenotype trait from a TEE mutation (the `phenotype_trait` payload).
     pub phenotype_trait: Option<String>,
-    /// Generasi hasil `splice_strains`/`divide_strain` (`EN-08`, maks `MAX_GENERATION`).
+    /// The generation produced by `splice_strains`/`divide_strain` (`EN-08`, max `MAX_GENERATION`).
     pub generation: u8,
     /// The organel set (`EN-07`); inherited on merger = endosymbiosis (`EN-120`).
     pub organel: OrganelleSlots,

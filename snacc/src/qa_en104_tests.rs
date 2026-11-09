@@ -10,14 +10,14 @@ mod qa_en104_tests {
     use near_sdk::testing_env;
     use near_sdk::NearToken;
 
-    fn akun(s: &str) -> near_sdk::AccountId {
+    fn acct(s: &str) -> near_sdk::AccountId {
         s.parse().unwrap()
     }
     fn ctx(predecessor: &str, deposit_yocto: u128, ts_sec: u64) {
         let mut b = VMContextBuilder::new();
-        b.current_account_id(akun("snacc-v001.testnet"))
-            .signer_account_id(akun(predecessor))
-            .predecessor_account_id(akun(predecessor))
+        b.current_account_id(acct("snacc-v001.testnet"))
+            .signer_account_id(acct(predecessor))
+            .predecessor_account_id(acct(predecessor))
             .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
             .block_timestamp(ts_sec * 1_000_000_000);
         testing_env!(b.build());
@@ -38,9 +38,9 @@ mod qa_en104_tests {
         let cap = 2_000u128 * 500 / 10_000; // 100
         for i in 0..30u64 {
             ctx("alkemis.testnet", 0, 1_000 + i * 60);
-            let w0 = c.get_total_wealth(akun("alkemis.testnet")).0;
+            let w0 = c.get_total_wealth(acct("alkemis.testnet")).0;
             let _ = c.feed_strain(id, U128(100));
-            let debit = w0 - c.get_total_wealth(akun("alkemis.testnet")).0;
+            let debit = w0 - c.get_total_wealth(acct("alkemis.testnet")).0;
             // THE EN-104 POINT: the quota runs out → granted locks at the cap — NO overdraw.
             assert!(
                 c.macro_state.epoch_burst_discount_granted <= cap,
@@ -108,9 +108,9 @@ fn tc_dk030_feeding_is_never_free() {
     let _ = c.strains.insert(id, v);
     for i in 0..5u64 {
         ctx("alkemis.testnet", 0, 1_000 + i * 60);
-        let w0 = c.get_total_wealth(akun("alkemis.testnet")).0;
+        let w0 = c.get_total_wealth(acct("alkemis.testnet")).0;
         let _ = c.feed_strain(id, U128(100));
-        let debit = w0 - c.get_total_wealth(akun("alkemis.testnet")).0;
+        let debit = w0 - c.get_total_wealth(acct("alkemis.testnet")).0;
         assert!(
             debit >= 1,
             "DK-030: feeding must always be paid (iteration {i}: debit {debit})"
@@ -131,7 +131,7 @@ fn tc_migrate_membersihkan_collection() {
         let _ = c.incubate_strain(StrainRole::Extractor, U128(10u128.pow(24)), 3);
     }
     let id = 4; // target TEE live vector
-    // Isi used_tee_chat_ids via TEE live vector (register → commit → apply).
+    // Populate used_tee_chat_ids via the live TEE vector (register → commit → apply).
     // In-repo fixture (the live TEE vector strain_id:4) — no dependence on external paths.
     let raw = include_str!("../tests/fixtures/tee-vector-live.json");
     let vec_json: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(raw).unwrap();
@@ -150,7 +150,7 @@ fn tc_migrate_membersihkan_collection() {
     );
     // Pre-migrate: the state is populated ✓.
     assert!(c.ft_total_supply().0 > 0, "the supply exists pre-migrate");
-    assert_eq!(c.get_strain(id).owner_id, akun("alkemis.testnet"));
+    assert_eq!(c.get_strain(id).owner_id, acct("alkemis.testnet"));
     // The chat_id is populated: a replay is rejected (the I-06 anti-replay is active).
 
     // MIGRATE → the generation prefix rises → ALL collections are empty.
