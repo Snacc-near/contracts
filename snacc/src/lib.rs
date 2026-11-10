@@ -3598,6 +3598,9 @@ mod qa_regression_tests;
 mod qa_f1_tests;
 
 #[cfg(test)]
+mod qa_f2_tests;
+
+#[cfg(test)]
 mod qa_div_tests;
 
 #[cfg(test)]
