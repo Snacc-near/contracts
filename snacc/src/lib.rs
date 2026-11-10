@@ -3601,6 +3601,9 @@ mod qa_f1_tests;
 mod qa_f2_tests;
 
 #[cfg(test)]
+mod qa_f6_tests;
+
+#[cfg(test)]
 mod qa_div_tests;
 
 #[cfg(test)]
