@@ -3604,6 +3604,9 @@ mod qa_f2_tests;
 mod qa_div_tests;
 
 #[cfg(test)]
+mod qa_macro_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use near_sdk::serde_json;
