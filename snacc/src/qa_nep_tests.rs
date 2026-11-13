@@ -204,7 +204,7 @@ mod qa_nep_tests {
         c.nft_transfer(
             test_account("bob.testnet"),
             a.to_string(),
-            Some("0".to_string()),
+            Some(0),
             None,
         );
         assert_eq!(c.nft_supply_for_owner(test_account("alkemis.testnet")).0, 0);

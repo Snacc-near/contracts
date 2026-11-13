@@ -145,9 +145,9 @@ mod qa_ma_tests {
         let _ = c.nft_transfer_call(
             acct("alice.testnet"),
             id.to_string(),
+            None,
+            None,
             "msg".to_string(),
-            None,
-            None,
         );
         assert_eq!(c.get_strain(id).pending_callbacks, 1, "the lock is on during transfer_call");
         // Resolved in the unit test: promise_result = Failed → rejected; the rejection path
@@ -164,7 +164,7 @@ mod qa_ma_tests {
             Default::default(),
             vec![near_sdk::PromiseResult::Failed]
         );
-        c.nft_resolve_transfer(acct("alkemis.testnet"), acct("alice.testnet"), id.to_string());
+        c.nft_resolve_transfer(acct("alkemis.testnet"), acct("alice.testnet"), id.to_string(), None);
         assert_eq!(c.get_strain(id).pending_callbacks, 0, "the lock is released after resolve");
         assert_eq!(c.get_strain(id).owner_id, acct("alkemis.testnet"), "the token returns");
     }

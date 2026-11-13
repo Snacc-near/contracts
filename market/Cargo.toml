@@ -1,0 +1,15 @@
+[package]
+name = "snacc-market"
+version = "0.1.0"
+edition = "2021"
+# EN-126 — a small testnet marketplace for Snacc strains: list via NEP-171
+# `nft_transfer_call`, buy with (testnet) NEAR, 0% fee. See market/README.md.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.29.1"  # same exact pin as the snacc crate (the Kamus Angka Resmi)
+
+[dev-dependencies]
+near-sdk = { version = "=5.29.1", features = ["unit-testing"] }
