@@ -14,7 +14,7 @@ pub mod svg;
 use near_sdk::json_types::U128;
 use near_sdk::serde::Deserialize;
 use near_sdk::store::{LookupMap, LookupSet, Vector};
-use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
+use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise, PromiseOrValue};
 use state::{
     constants, AlkemisProfile, Epoch, FeederEntry, MacroState, MacroStateView, MacroZone,
     MnaLogEntry, NftMetadataView, NftTokenView, NpcMerchantAgent, NpcQuoteView, OrganelleSlots,
@@ -3305,6 +3305,16 @@ impl SnaccContract {
 // =====================================================================
 // Pipeline #5 — LC-16: whole-cell transplantation (`NEP-171` nft_transfer)
 // =====================================================================
+
+/// `EN-126` — gas reserved for the `nft_resolve_transfer` callback (lock release,
+/// optional revert with the colony index move, event).
+const GAS_FOR_RESOLVE_TRANSFER: near_sdk::Gas = near_sdk::Gas::from_tgas(20);
+/// `EN-126` — gas `nft_transfer_call` keeps back from the receiver: its own execution
+/// (transfer core + promise creation) plus `GAS_FOR_RESOLVE_TRANSFER`. The receiver's
+/// `nft_on_transfer` gets `prepaid_gas − GAS_FOR_NFT_TRANSFER_CALL`.
+const GAS_FOR_NFT_TRANSFER_CALL: near_sdk::Gas =
+    near_sdk::Gas::from_tgas(30 + GAS_FOR_RESOLVE_TRANSFER.as_tgas());
+
 #[near]
 impl SnaccContract {
     /// Move a colony index entry: out of the `from` list, into the `to` list.
@@ -3330,30 +3340,44 @@ impl SnaccContract {
         }
     }
 
-    /// `LC-16` — standard `NEP-171` `nft_transfer`: whole-cell transplantation — the
-    /// `$SNACC` balance (stomach), spores/inventory, organelles, ATP, and `state_nonce` follow
-    /// the vessel (all state is keyed by `strain_id`). Exactly 1 yoctoNEAR required.
-    /// `approval_id` is accepted for NEP-171 ABI shape; the `NEP-178` approval registry
-    /// is not implemented (recorded decision — the parameter is ignored).
-    /// Dead cells (`Liquidated`/`SplicedBurned`) cannot be transferred.
-    #[payable]
-    pub fn nft_transfer(
-        &mut self,
-        receiver_id: AccountId,
-        token_id: String,
-        approval_id: Option<String>,
-        memo: Option<String>,
+    /// The `nep171` `nft_transfer` NEP-297 event — one shape for every ownership move
+    /// (`nft_transfer`, `nft_transfer_call`, and the `nft_resolve_transfer` revert).
+    fn emit_nft_transfer_event(
+        old_owner_id: &AccountId,
+        new_owner_id: &AccountId,
+        strain_id: StrainId,
+        memo: Option<&str>,
     ) {
-        // NEP-178 (approval management) is not implemented yet — the parameter is accepted
-        // for NEP-171 ABI shape and ignored (recorded decision).
-        let _ = approval_id;
-        Self::assert_one_yocto();
-        assert_ne!(
-            receiver_id,
-            env::predecessor_account_id(),
-            "{}",
-            constants::ERR_SAME_STRAIN
+        events::emit_standard_event(
+            "nep171",
+            "nft_transfer",
+            &format!(
+                r#"{{"old_owner_id":"{}","new_owner_id":"{}","token_ids":["{}"],"approved_account_ids":null,"memo":{}}}"#,
+                old_owner_id,
+                new_owner_id,
+                strain_id,
+                match memo {
+                    Some(m) => near_sdk::serde_json::to_string(m).unwrap(),
+                    None => "null".to_string(),
+                }
+            ),
         );
+    }
+
+    /// `LC-16` / `EN-126` — the shared transfer core behind `nft_transfer` and
+    /// `nft_transfer_call`, so both apply exactly the same Snacc rules: `sender_id` must
+    /// own the strain (`ERR_NOT_OWNED_BY_CALLEE`), no self-transfer (`ERR_SAME_STRAIN`),
+    /// dead cells cannot move (`ERR_ALREADY_LIQUIDATED`), `state_nonce` is bumped, the
+    /// colony index moves on both sides, and the `nep171` event is emitted.
+    /// Returns `(strain_id, previous_owner_id)`.
+    fn internal_nft_transfer(
+        &mut self,
+        sender_id: &AccountId,
+        receiver_id: &AccountId,
+        token_id: &str,
+        memo: Option<&str>,
+    ) -> (StrainId, AccountId) {
+        assert_ne!(receiver_id, sender_id, "{}", constants::ERR_SAME_STRAIN);
         let strain_id: StrainId = token_id
             .parse()
             .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
@@ -3364,8 +3388,8 @@ impl SnaccContract {
             .clone();
         let old_owner = v.owner_id.clone();
         assert_eq!(
-            env::predecessor_account_id(),
-            old_owner,
+            sender_id,
+            &old_owner,
             "{}",
             constants::ERR_NOT_OWNED_BY_CALLEE
         );
@@ -3380,113 +3404,144 @@ impl SnaccContract {
         v.owner_id = receiver_id.clone();
         v.record_mutation();
         let _ = self.strains.insert(strain_id, v);
-        self.move_strain_owner_index(strain_id, &old_owner, &receiver_id);
+        self.move_strain_owner_index(strain_id, &old_owner, receiver_id);
         // NEP-297 event with standard `nep171` — the exact NEP-171 standard shape.
-        events::emit_standard_event(
-            "nep171",
-            "nft_transfer",
-            &format!(
-                r#"{{"old_owner_id":"{}","new_owner_id":"{}","token_ids":["{}"],"approved_account_ids":null,"memo":{}}}"#,
-                old_owner,
-                receiver_id,
-                token_id,
-                match memo {
-                    Some(m) => near_sdk::serde_json::to_string(&m).unwrap(),
-                    None => "null".to_string(),
-                }
-            ),
-        );
+        Self::emit_nft_transfer_event(&old_owner, receiver_id, strain_id, memo);
+        (strain_id, old_owner)
     }
 
-    /// `LC-16` — standard NEP-171 `nft_transfer_call`: transfer + a `receiver.nft_on_transfer`
-    /// promise + a `#[private] nft_resolve_transfer` callback
-    /// that returns the token when the receiver's contract rejects / fails.
+    /// `LC-16` — standard `NEP-171` `nft_transfer`: whole-cell transplantation — the
+    /// `$SNACC` balance (stomach), spores/inventory, organelles, ATP, and `state_nonce` follow
+    /// the vessel (all state is keyed by `strain_id`). Exactly 1 yoctoNEAR required.
+    /// `approval_id` is accepted for NEP-171 ABI shape (`number|null`); the `NEP-178`
+    /// approval registry is not implemented (recorded decision — the parameter is ignored).
+    /// Dead cells (`Liquidated`/`SplicedBurned`) cannot be transferred.
+    #[payable]
+    pub fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: String,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) {
+        // NEP-178 (approval management) is not implemented yet — the parameter is accepted
+        // for NEP-171 ABI shape and ignored (recorded decision).
+        let _ = approval_id;
+        Self::assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        let _ = self.internal_nft_transfer(&sender_id, &receiver_id, &token_id, memo.as_deref());
+    }
+
+    /// `LC-16` / `EN-126` — standard NEP-171 `nft_transfer_call`: the same transfer core
+    /// as `nft_transfer` (every Snacc rule applies identically), then
+    /// `receiver_id.nft_on_transfer(sender_id, previous_owner_id, token_id, msg)` with all
+    /// prepaid gas except `GAS_FOR_NFT_TRANSFER_CALL`, then the `#[private]`
+    /// `nft_resolve_transfer` callback (`GAS_FOR_RESOLVE_TRANSFER` reserved). Exactly
+    /// 1 yoctoNEAR required. Resolves to `false` only when the token was returned.
     #[payable]
     pub fn nft_transfer_call(
         &mut self,
         receiver_id: AccountId,
         token_id: String,
-        msg: String,
-        approval_id: Option<String>,
+        approval_id: Option<u64>,
         memo: Option<String>,
-    ) -> Promise {
-        self.nft_transfer(receiver_id.clone(), token_id.clone(), approval_id, memo);
+        msg: String,
+    ) -> PromiseOrValue<bool> {
+        // NEP-178 is not implemented — `approval_id` is accepted for ABI shape and ignored.
+        let _ = approval_id;
+        Self::assert_one_yocto();
+        assert!(
+            env::prepaid_gas() > GAS_FOR_NFT_TRANSFER_CALL,
+            "{}",
+            constants::ERR_MORE_GAS_REQUIRED
+        );
+        let sender_id = env::predecessor_account_id();
+        let (strain_id, previous_owner_id) =
+            self.internal_nft_transfer(&sender_id, &receiver_id, &token_id, memo.as_deref());
         // SEC-111 (triage Option a) — lock `pending_callbacks` during the promise window;
-        // released in `nft_resolve_transfer` (all paths).
-        let strain_id: StrainId = token_id
-            .parse()
-            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
+        // released in `nft_resolve_transfer` (all paths). A counter, so a receiver that
+        // forwards the token with another `nft_transfer_call` does not unlock it early.
         if let Some(mut v) = self.strains.get(&strain_id).cloned() {
-            v.pending_callbacks = 1;
+            v.pending_callbacks = v.pending_callbacks.saturating_add(1);
             v.record_mutation();
             let _ = self.strains.insert(strain_id, v);
         }
-        let sender_id = env::predecessor_account_id();
+        let token_id = strain_id.to_string();
         let args = near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
             "sender_id": sender_id,
-            "previous_owner_id": sender_id,
+            "previous_owner_id": previous_owner_id,
             "token_id": token_id,
             "msg": msg,
         }))
-        .unwrap();
+        .unwrap_or_else(|_| env::abort());
         Promise::new(receiver_id.clone())
             .function_call(
                 "nft_on_transfer".to_string(),
                 args,
-                NearToken::from_near(0),
-                near_sdk::Gas::from_tgas(20),
+                NearToken::from_yoctonear(0),
+                env::prepaid_gas().saturating_sub(GAS_FOR_NFT_TRANSFER_CALL),
             )
-            .then(Self::ext(env::current_account_id()).nft_resolve_transfer(
-                sender_id,
-                receiver_id,
-                token_id,
-            ))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                    .nft_resolve_transfer(previous_owner_id, receiver_id, token_id, None),
+            )
+            .into()
     }
 
-    /// `ADR-24` — `nft_transfer_call` resolution (anti-spoofing): the receiver's contract
-    /// returns a `bool` (`true` = rejected); a failed promise counts as rejected;
-    /// the token returns to the previous owner (the colony index follows).
+    /// `ADR-24` / `EN-126` — `nft_transfer_call` resolution (NEP-171 core). The receiver's
+    /// `nft_on_transfer` returns a `bool` (`true` = give the token back); a failed promise
+    /// or a non-`bool` result also counts as "give back". The token is returned to
+    /// `previous_owner_id` ONLY while it is still owned by `receiver_id` and still alive
+    /// (a receiver that already moved it on, or a cell that died in the window, is left
+    /// as is). Returns `false` only when the token was returned to `previous_owner_id`;
+    /// otherwise `true` (the transfer to `receiver_id` stands, NEP-171).
+    /// `approved_account_ids` is always `null` (no `NEP-178` registry).
     #[private]
     pub fn nft_resolve_transfer(
         &mut self,
         previous_owner_id: AccountId,
         receiver_id: AccountId,
         token_id: String,
-    ) {
+        approved_account_ids: Option<std::collections::HashMap<AccountId, u64>>,
+    ) -> bool {
+        let _ = approved_account_ids;
+        let Ok(strain_id) = token_id.parse::<StrainId>() else {
+            return true;
+        };
         // SEC-111 — release the `pending_callbacks` lock on ALL paths (accepted/rejected).
-        let strain_id_lock: StrainId = token_id
-            .parse()
-            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
-        if let Some(mut v) = self.strains.get(&strain_id_lock).cloned() {
-            v.pending_callbacks = 0;
-            v.record_mutation();
-            let _ = self.strains.insert(strain_id_lock, v);
-        }
-        let rejected = match env::promise_result_checked(0, usize::MAX) {
+        let Some(mut v) = self.strains.get(&strain_id).cloned() else {
+            return true;
+        };
+        v.pending_callbacks = v.pending_callbacks.saturating_sub(1);
+        v.record_mutation();
+        // A bool is at most 5 bytes; a longer result is not a valid answer → give back.
+        let must_revert = match env::promise_result_checked(0, 16) {
             Ok(bytes) => near_sdk::serde_json::from_slice::<bool>(&bytes).unwrap_or(true),
             Err(_) => true,
         };
-        if !rejected {
-            return;
-        }
-        let strain_id: StrainId = token_id
-            .parse()
-            .unwrap_or_else(|_| env::panic_str(constants::ERR_STRAIN_NOT_FOUND));
-        if let Some(mut v) = self.strains.get(&strain_id).cloned() {
-            let current_owner = v.owner_id.clone();
-            v.owner_id = previous_owner_id.clone();
-            v.record_mutation();
-            let _ = self.strains.insert(strain_id, v);
-            self.move_strain_owner_index(strain_id, &current_owner, &previous_owner_id);
-            events::emit_standard_event(
-                "nep171",
-                "nft_transfer",
-                &format!(
-                    r#"{{"old_owner_id":"{}","new_owner_id":"{}","token_ids":["{}"],"approved_account_ids":null,"memo":"nft_transfer_call rejected"}}"#,
-                    receiver_id, previous_owner_id, token_id
-                ),
+        let still_with_receiver = v.owner_id == receiver_id
+            && !matches!(
+                v.status,
+                StrainStatus::Liquidated | StrainStatus::SplicedBurned
             );
+        if !must_revert || !still_with_receiver {
+            let _ = self.strains.insert(strain_id, v);
+            // NEP-171 (same as `near-contract-standards`): the transfer to `receiver_id`
+            // stands — `true`. Only an actual revert returns `false`.
+            return true;
         }
+        v.owner_id = previous_owner_id.clone();
+        v.record_mutation();
+        let _ = self.strains.insert(strain_id, v);
+        self.move_strain_owner_index(strain_id, &receiver_id, &previous_owner_id);
+        Self::emit_nft_transfer_event(
+            &receiver_id,
+            &previous_owner_id,
+            strain_id,
+            Some("nft_transfer_call rejected"),
+        );
+        false
     }
 }
 
@@ -3614,6 +3669,9 @@ mod qa_svg_tests;
 
 #[cfg(test)]
 mod qa_npc_tests;
+
+#[cfg(test)]
+mod qa_en126_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6413,9 +6471,9 @@ mod tests {
         let _ = c.nft_transfer_call(
             ALICE.parse().unwrap(),
             "1".to_string(),
+            None,
+            None,
             "sell".to_string(),
-            None,
-            None,
         );
         // Simulate the callback: the receiver's contract ACCEPTS (false).
         let mut builder = VMContextBuilder::new();
@@ -6432,11 +6490,12 @@ mod tests {
                 near_sdk::serde_json::to_vec(&false).unwrap()
             )]
         );
-        c.nft_resolve_transfer(
+        assert!(c.nft_resolve_transfer(
             ALKEMIS_ID.parse().unwrap(),
             ALICE.parse().unwrap(),
             "1".to_string(),
-        );
+            None,
+        ));
         assert_eq!(c.get_strain(1).owner_id.to_string(), ALICE);
     }
 
@@ -6449,9 +6508,9 @@ mod tests {
         let _ = c.nft_transfer_call(
             ALICE.parse().unwrap(),
             "1".to_string(),
+            None,
+            None,
             "sell".to_string(),
-            None,
-            None,
         );
         let mut builder = VMContextBuilder::new();
         builder
@@ -6465,11 +6524,12 @@ mod tests {
             Default::default(),
             vec![near_sdk::PromiseResult::Failed]
         );
-        c.nft_resolve_transfer(
+        assert!(!c.nft_resolve_transfer(
             ALKEMIS_ID.parse().unwrap(),
             ALICE.parse().unwrap(),
             "1".to_string(),
-        );
+            None,
+        ));
         // Returns to the old owner + the index recovers.
         assert_eq!(c.get_strain(1).owner_id.to_string(), ALKEMIS_ID);
         assert_eq!(c.get_colony(ALKEMIS_ID.parse().unwrap()).len(), 1);

@@ -161,6 +161,9 @@ pub mod constants {
     pub const ERR_ACCOUNT_NOT_REGISTERED: &str = "ERR_ACCOUNT_NOT_REGISTERED";
     /// `N141` — error code: `ft_transfer`/`ft_transfer_call` without exactly 1 yoctoNEAR.
     pub const ERR_YOCTO_REQUIRED: &str = "ERR_YOCTO_REQUIRED";
+    /// `EN-126` — error code: `nft_transfer_call` with less prepaid gas than it must
+    /// reserve for itself + the `nft_resolve_transfer` callback.
+    pub const ERR_MORE_GAS_REQUIRED: &str = "ERR_MORE_GAS_REQUIRED";
     /// `DK-033/044` — error codes (exact names from the Spec Dividend Pool §6).
     pub const ERR_NOT_STRAIN_OWNER: &str = "ERR_NOT_STRAIN_OWNER";
     pub const ERR_ROLE_LOCKED_NEEDS_SYNTHESIZER_GENE: &str =
